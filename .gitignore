@@ -1,0 +1,19 @@
+# Environments
+.venv/
+.claude/
+
+# Ignore the contents of data/config, but not the folder itself
+data/config/*
+# Now allow the specific files
+!data/config/__init__.py
+!data/config/config.py
+
+# Ignore everything else in scenario_data
+data/scenario_data/
+
+# Python Caches
+**/__pycache__/
+*.py[cod]
+
+# Secrets
+gurobi.lic

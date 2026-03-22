@@ -11,8 +11,10 @@ logging.basicConfig(level=logging)
 logger = logging.getLogger(__name__)
 
 
+OUTPUT_DIR = "output"
+
 class EntryWriter:
-    def get_next_index(self, base_filename, folder="."):
+    def get_next_index(self, base_filename, folder=OUTPUT_DIR):
         pattern = re.compile(rf"{re.escape(base_filename)}_(\d+)\.csv")
         max_index = 0
         for fname in os.listdir(folder):
@@ -23,18 +25,18 @@ class EntryWriter:
         return max_index + 1
 
     def __init__(self, base_filename="data_results"):
-        self.file_index = self.get_next_index(base_filename) 
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        self.file_index = self.get_next_index(base_filename)
         self.data_entry_count=0
         self.HN_entry_count=0
-        # Create a dictionary of file handles for each HN
         self.current_file = self._open_file("data_results")
         self.HN_file=self._open_file("HN_results")
 
 
     def _open_file(self, filename):
-        """Open one file per HN and return as dictionary."""
+        """Open a CSV file inside OUTPUT_DIR and return the file handle."""
         filename = f"{filename}_{self.file_index}.csv"
-        file = open(filename, "w", buffering=1)  # Line buffering
+        file = open(os.path.join(OUTPUT_DIR, filename), "w", buffering=1)  # Line buffering
         return file
     
     def close(self):

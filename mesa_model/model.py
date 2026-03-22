@@ -206,11 +206,11 @@ class LEM(mesa.Model):
         self.grid.storage["id"]="None"
         for a in range (0,len(self.grid.storage)):
             if self.grid.storage.loc[a]["bus"]!=4:
-                storage(self, self.grid.storage.loc[a]["max_e_mwh"]*1000, self.grid.storage.loc[a]["p_mw"]*-1000, self.grid.storage.loc[a]["bus"],self.grid.storage.loc[a]["efficiency_percent"], 1-self.grid.storage.loc[a]["self-discharge_percent_per_day"], "optimisation")
+                storage(self, self.grid.storage.loc[a]["max_e_mwh"]*1000, self.grid.storage.loc[a]["p_mw"]*-1000, self.grid.storage.loc[a]["bus"],self.grid.storage.loc[a]["efficiency_percent"], 1-self.grid.storage.loc[a]["self-discharge_percent_per_day"]/100, "optimisation")
             self.grid.storage.loc[a]["id"]=id_count
             id_count+=1
         a=0
-        storage(self, self.grid.storage.loc[a]["max_e_mwh"]*1000, self.grid.storage.loc[a]["p_mw"]*-1000, 5,self.grid.storage.loc[a]["efficiency_percent"], 1-self.grid.storage.loc[a]["self-discharge_percent_per_day"], "learning")
+        storage(self, self.grid.storage.loc[a]["max_e_mwh"]*1000, self.grid.storage.loc[a]["p_mw"]*-1000, 5,self.grid.storage.loc[a]["efficiency_percent"], 1-self.grid.storage.loc[a]["self-discharge_percent_per_day"]/100, "learning")
         
         for aa in self.grid.load.index:
                 profile_str = self.grid.load.at[aa,"profile"]
@@ -598,9 +598,17 @@ class LEM(mesa.Model):
         self.market_optimizer.compute_allocation(new_bid_data, new_ask_data)
         self.data=self.market_optimizer.process_pyomo_results(new_market_variable, new_non_LEC_data)
  
-        self.results[self.stepcount]=self.data 
+        self.results[self.stepcount]=self.data
+        # Inject actual agent SOC into storage results (market optimizer has no access to internal SOC)
+        storage_res = self.results[self.stepcount].get("storage")
+        if storage_res is not None and len(storage_res) > 0:
+            for agent in self.agents:
+                if agent.typ == "storage":
+                    mask = storage_res["Agent ID"] == agent.unique_id
+                    if mask.any():
+                        self.results[self.stepcount]["storage"].loc[mask, "SOC_rel"] = agent.soc
         if len(self.results)>10:
-            del self.results[min(self.results)] 
+            del self.results[min(self.results)]
 
 
 

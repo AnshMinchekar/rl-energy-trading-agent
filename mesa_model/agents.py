@@ -19,6 +19,7 @@ import warnings
 warnings.simplefilter("ignore", category=FutureWarning)
 import gc
 import json
+import os
 
 def initialize(self, typ, factor, cosphi, bus):
     self.typ=typ
@@ -404,7 +405,10 @@ class storage(mesa.Agent):
     def __init__(self, model, capacity, power, node, efficiency, discharge, method):
         super().__init__(model)
         self.capacity = capacity
-        self.discharge = 1
+        # discharge is a per-day retention factor (e.g. 0.87 → lose 13% per day).
+        # Scale to per-step so update_status applies the right fraction each timestep.
+        timestep_frac = self.model.timestep.seconds / 86400.0
+        self.discharge = discharge ** timestep_frac
         self.efficiency = efficiency
         self.max_power = power
         self.bus = node
@@ -435,32 +439,41 @@ class storage(mesa.Agent):
         self.coefficients_bid = [0, 0]
         
         if self.method == "learning":
-            self.soc = 0.55 
+            self.soc = config.storage["SOC_start"]
             
-            self.theta = {
-                "layer1": {
-                    "soc_w": -3.0,
-                    "price_w": -1.2,
-                    "price_diff_w": 0.8,
-                    "forecast_1h_w": 0.5,
-                    "forecast_4h_w": 0.5,
-                    "time_w": 0.2,
-                    "dow_w": 0.0,
-                    "bias": -0.2,
-                },
-                "layer2": {
-                    "hidden_w": 1.5,
-                    "bias": -0.1,
-                }
-            }
-            
+            # 4-neuron hidden layer stored as numpy arrays.
+            # Input order: [soc, price_norm, price_diff_1h, price_diff_4h,
+            #               sin_hour, cos_hour, sin_dow, cos_dow, price_percentile]
+            # (max_discharge and max_charge removed — fully determined by soc)
+            # (hour/dow replaced by sin/cos pairs for continuous circular encoding)
+            # Neuron intuitions:
+            #   0 – price-timing:   sell high-price/high-SOC, buy low-price/low-SOC
+            #   1 – SOC management: charge when low, discharge when high
+            #   2 – forecast:       react to upcoming price changes
+            #   3 – time-of-day:    capture daily demand cycles via circular time
+            n_hidden, n_inputs = 4, 9
+            # Small random initialization so gradients can flow from the start.
+            # Scale 0.1 keeps the initial policy output near-neutral (±0.1 range)
+            # so the soc/price biases drive early exploration, but non-zero h1 and
+            # W2 ensure ΔW = lr × δ × h1 is non-zero and learning can begin.
+            rng = np.random.RandomState(seed=42)
+            scale = 0.1
+            W1 = rng.randn(n_hidden, n_inputs).astype(float) * scale
+            b1 = np.zeros(n_hidden, dtype=float)
+            W2 = rng.randn(n_hidden).astype(float) * scale
+            b2 = np.array([0.0], dtype=float)
 
+            self.theta = {"W1": W1, "b1": b1, "W2": W2, "b2": b2}
+
+            # Critic value function weights (linear approximation).
+            # Warm-started with sensible priors so the critic isn't fully blind early on.
             self.value_theta = {
-                "soc_w": 0.0,           
-                "soc_sq_w": 0.0,        # Quadratic SOC term (penalize extremes)
-                "price_w": 0.0,        
-                "price_diff_w": 0.0,    
-                "hour_w": 0.0,          
+                "soc_w":      0.0,
+                "soc_sq_w":  -1.0,   # penalise SOC extremes from the start
+                "price_w":    0.3,   # higher price → better state to sell from
+                "price_diff_w": 0.0,
+                "hour_w":     0.0,
+                "bias":       0.0,
             }
             
             self.actor_lr = 0.03       # Policy learning rate
@@ -472,8 +485,9 @@ class storage(mesa.Agent):
             # Tracking
             self.last_state = None
             self.last_action = None
-            self.last_hidden = None
-            self.episode_rewards = []
+            self.last_raw_action = None   # raw tanh(z) before bias/noise — used for gradients
+            self.last_hidden = None       # post-activation h1 (shape: n_hidden)
+            self.last_h1_in = None        # pre-activation h1_in — needed for LeakyReLU derivative
             self.episode_profits = []
             self.cumulative_reward = 0
             self.cumulative_profit = 0
@@ -490,18 +504,22 @@ class storage(mesa.Agent):
             # Performance tracking
             self.best_profit = -np.inf
             self.best_theta = None
-            self.soc_history = []
+            self.soc_history = deque(maxlen=2000)
             
             # SOC operating range
-            self.soc_floor = 0.25
+            self.soc_floor = 0.10
             self.soc_ceiling = 0.75
             self.soc_target = 0.45
             
-            # Price cache
+            # Price cache (for fast point lookups and forecasts)
             self._price_index = None
             self._price_array = None
             self._price_cache_ready = False
-            
+
+            # Rolling 24-hour observed price history (96 steps × 15 min = 24 h).
+            # Used for average/percentile so we only use prices the agent has seen.
+            self.price_history = deque(maxlen=96)
+
             # TD learning tracking
             self.td_errors = []  # Track TD errors for debugging
 
@@ -567,106 +585,99 @@ class storage(mesa.Agent):
         return self.get_current_price()
 
     def get_average_price(self, hours_back=24):
-        """Get average price over last N hours."""
-        if not self._price_cache_ready:
-            self._initialize_price_cache()
-        
-        try:
-            steps_back = int(hours_back * 3600 / self.model.timestep.seconds)
-            
-            if self._price_cache_ready and self._price_array is not None:
-                recent_prices = self._price_array[-steps_back:]
-                if len(recent_prices) > 0:
-                    return float(np.mean(recent_prices))
-        except (AttributeError, TypeError):
-            pass
+        """Get average price over the last N observed hours.
+
+        Uses the rolling price_history deque (populated in update_status) so only
+        prices the agent has actually seen are included — no future leakage.
+        """
+        if len(self.price_history) > 0:
+            return float(np.mean(self.price_history))
         return self.get_current_price()
 
     def get_price_percentile(self, hours_back=24):
-        """Get current price percentile relative to recent prices."""
-        if not self._price_cache_ready:
-            self._initialize_price_cache()
-        
-        try:
-            steps_back = int(hours_back * 3600 / self.model.timestep.seconds)
+        """Get current price percentile relative to recent observed prices."""
+        if len(self.price_history) > 1:
             current_price = self.get_current_price()
-            
-            if self._price_cache_ready and self._price_array is not None:
-                recent_prices = self._price_array[-steps_back:]
-                if len(recent_prices) > 0:
-                    percentile = np.sum(recent_prices < current_price) / len(recent_prices)
-                    return percentile
-        except (AttributeError, TypeError):
-            pass
+            arr = np.array(self.price_history)
+            return float(np.sum(arr < current_price) / len(arr))
         return 0.5
 
     
     def build_state(self):
-        """Build state representation for RL policy."""
+        """Build state representation for RL policy.
+
+        State (9-D):
+          [soc, price_norm, price_diff_1h, price_diff_4h,
+           sin_hour, cos_hour, sin_dow, cos_dow, price_percentile]
+
+        Time is encoded as sin/cos pairs for continuity across midnight and week boundaries.
+        max_discharge/max_charge are omitted — they are deterministic functions of soc.
+        """
         soc = float(self.soc)
-        max_discharge, max_charge = self.provide_a_power()
-        
+
         price_now = self.get_current_price()
         price_forecast_1h = self.get_price_forecast(1)
         price_forecast_4h = self.get_price_forecast(4)
         avg_price = self.get_average_price(24)
         price_percentile = self.get_price_percentile(24)
-        
-        price_norm = (price_now - avg_price) / (avg_price + 1e-6)
+
+        price_norm    = (price_now - avg_price) / (avg_price + 1e-6)
         price_diff_1h = (price_forecast_1h - price_now) / (price_now + 1e-6)
         price_diff_4h = (price_forecast_4h - price_now) / (price_now + 1e-6)
-        
+
         current_time = self.model.current_date
-        hour_norm = current_time.hour / 23.0
-        dow_norm = current_time.weekday() / 6.0
-        
-        return [soc, float(max_discharge), float(max_charge), price_norm, 
-                price_diff_1h, price_diff_4h, hour_norm, dow_norm, price_percentile]
+        hour_rad = 2 * np.pi * current_time.hour / 24.0
+        dow_rad  = 2 * np.pi * current_time.weekday() / 7.0
+        sin_hour, cos_hour = float(np.sin(hour_rad)), float(np.cos(hour_rad))
+        sin_dow,  cos_dow  = float(np.sin(dow_rad)),  float(np.cos(dow_rad))
+
+        return [soc, price_norm, price_diff_1h, price_diff_4h,
+                sin_hour, cos_hour, sin_dow, cos_dow, price_percentile]
 
     
     def estimate_value(self, state):
+        # State layout: [soc, price_norm, price_diff_1h, price_diff_4h,
+        #                sin_hour, cos_hour, sin_dow, cos_dow, price_percentile]
+        soc        = state[0]
+        price_norm = state[1]
+        price_diff = state[2]
+        sin_hour   = state[4]   # hour_w now tracks sin(hour) — continuous proxy for time-of-day
 
-        soc = state[0]
-        price_norm = state[3]
-        price_diff = state[4]
-        hour_norm = state[6]
-        
         value = (
-            self.value_theta["soc_w"] * (soc - self.soc_target) +
-            self.value_theta["soc_sq_w"] * ((soc - self.soc_target) ** 2) +
-            self.value_theta["price_w"] * price_norm +
+            self.value_theta["soc_w"]      * (soc - self.soc_target) +
+            self.value_theta["soc_sq_w"]   * ((soc - self.soc_target) ** 2) +
+            self.value_theta["price_w"]    * price_norm +
             self.value_theta["price_diff_w"] * price_diff +
-            self.value_theta["hour_w"] * hour_norm +
+            self.value_theta["hour_w"]     * sin_hour +
             self.value_theta["bias"]
         )
-        
+
         return value
 
     def policy(self, state):
-        """Two-layer neural network policy with soft biases."""
-        soc, max_discharge, max_charge, price_norm, price_diff_1h, price_diff_4h, hour_norm, dow_norm, price_percentile = state
-        
-        # Layer 1: Hidden layer
-        h1_input = (
-            self.theta["layer1"]["soc_w"] * (soc - self.soc_target) +
-            self.theta["layer1"]["price_w"] * price_norm +
-            self.theta["layer1"]["price_diff_w"] * price_diff_1h +
-            self.theta["layer1"]["forecast_1h_w"] * price_diff_1h +
-            self.theta["layer1"]["forecast_4h_w"] * price_diff_4h +
-            self.theta["layer1"]["time_w"] * hour_norm +
-            self.theta["layer1"]["dow_w"] * dow_norm +
-            self.theta["layer1"]["bias"]
-        )
-        
-        # LeakyReLU activation
-        h1 = np.where(h1_input > 0, h1_input, 0.1 * h1_input)
+        """Two-layer neural network policy (4 hidden neurons).
+
+        Returns
+        -------
+        action      : float in [-1, 1]  — final action sent to the market
+        raw_action  : float             — tanh(z) before any bias/noise/clip (used for gradients)
+        h1          : ndarray (n_hidden,) — post-activation hidden values
+        h1_in       : ndarray (n_hidden,) — pre-activation hidden values (for LeakyReLU derivative)
+        """
+        x = np.array(state, dtype=float)   # shape (9,)
+        soc, _, _, _, _, _, _, _, price_percentile = state
+
+        # --- Layer 1: hidden (LeakyReLU) ---
+        h1_in = self.theta["W1"] @ x + self.theta["b1"]          # (n_hidden,)
+        h1 = np.where(h1_in > 0, h1_in, 0.1 * h1_in)            # LeakyReLU
         h1 = np.clip(h1, -5.0, 5.0)
-        
-        # Layer 2: Output
-        z = self.theta["layer2"]["hidden_w"] * h1 + self.theta["layer2"]["bias"]
-        action = np.tanh(z)
-        
-        # Soft biases (nudge action but let network learn)
+
+        # --- Layer 2: output (Tanh) ---
+        z = float(np.dot(self.theta["W2"], h1) + self.theta["b2"][0])
+        raw_action = float(np.tanh(z))                            # kept clean for gradient use
+        action = raw_action
+
+        # --- Soft biases (10% influence — reduced from 40% to limit credit-assignment noise) ---
         soc_bias = 0.0
         if soc < 0.15:
             soc_bias = 0.8
@@ -682,7 +693,7 @@ class storage(mesa.Agent):
             soc_bias = -0.3
         elif soc > self.soc_target:
             soc_bias = -0.1
-        
+
         price_bias = 0.0
         if price_percentile < 0.15:
             price_bias = 0.4
@@ -692,39 +703,44 @@ class storage(mesa.Agent):
             price_bias = -0.4
         elif price_percentile > 0.75:
             price_bias = -0.2
-        
-        # Combine: 60% network, 40% biases
-        action = 0.6 * action + 0.4 * (soc_bias + price_bias)
-        
-        # Exploration noise
+
+        # 90% network / 10% bias so the learned policy dominates
+        action = 0.9 * action + 0.1 * (soc_bias + price_bias)
+
+        # --- Exploration noise ---
         if 0.20 < soc < 0.90:
-            exploration = max(self.min_exploration, self.exploration_rate)
-            noise = np.random.normal(0, exploration * 0.4)
+            noise = np.random.normal(0, max(self.min_exploration, self.exploration_rate) * 0.4)
             action += noise
-        
-        action = np.clip(action, -1, 1)
-        
-        # Hard override only for emergencies
+
+        action = float(np.clip(action, -1.0, 1.0))
+
+        # --- Hard override: true emergencies only ---
         if soc < 0.10:
             action = 1.0
         elif soc > 0.95:
             action = -1.0
-        
-        return action, h1
+
+        return action, raw_action, h1, h1_in
 
     
     def action_to_bid(self, action):
-        """Convert RL action to market bid/ask with SENSIBLE prices."""
+        """Convert RL action to market bid/ask.
+
+        Override policy:
+          soc < 0.10          → emergency charge (hard override, return early)
+          soc < soc_floor     → clip action so the agent can only charge (RL magnitude kept)
+          otherwise           → full RL control
+        """
         self.ask = [0, 0, self.offer_function(0), "lin"]
         self.bid = [0, 0, self.offer_function(0), "lin"]
         self.coefficients_ask = [0, 0]
         self.coefficients_bid = [0, 0]
-        
+
         max_discharge, max_charge = self.provide_a_power()
         eps = 1e-6
         price_now = self.get_current_price()
-        
-        # Emergency charging
+
+        # --- True emergency: charge at any cost ---
         if self.soc < 0.10:
             if max_charge > eps:
                 bid_price = 1000.0
@@ -732,89 +748,88 @@ class storage(mesa.Agent):
                 self.bid = [max_charge, max_charge, bid_fun, "lin"]
                 self.coefficients_bid = [0, bid_price * (self.model.timestep.seconds / 3600)]
             return
-        
-        if self.soc < 0.20:
-            if max_charge > eps:
-                bid_price = price_now * 12.0 + 400
-                bid_fun = self.offer_function(bid_price)
-                self.bid = [max_charge * 0.7, max_charge, bid_fun, "lin"]
-                self.coefficients_bid = [0, bid_price * (self.model.timestep.seconds / 3600)]
-            return
-        
+
+        # --- Below soc_floor: allow charge-only (keep RL magnitude, forbid discharge) ---
         if self.soc < self.soc_floor:
-            if max_charge > eps:
-                bid_price = price_now * 4.0 + 150
-                bid_fun = self.offer_function(bid_price)
-                self.bid = [max_charge * 0.4, max_charge, bid_fun, "lin"]
-                self.coefficients_bid = [0, bid_price * (self.model.timestep.seconds / 3600)]
-            return
-        
+            action = max(action, 0.0)
+
+        # --- Safe discharge ceiling ---
         if self.soc > self.soc_floor:
             max_safe_discharge_kwh = (self.soc - self.soc_floor) * self.capacity
-            max_safe_discharge_power = max_safe_discharge_kwh * (3600 / self.model.timestep.seconds) / self.model.sref * self.efficiency
+            max_safe_discharge_power = (
+                max_safe_discharge_kwh * (3600 / self.model.timestep.seconds)
+                / self.model.sref * self.efficiency
+            )
             max_safe_discharge = min(max_discharge, max_safe_discharge_power)
         else:
             max_safe_discharge = 0
-        
-        if action > eps:  # Charge
+
+        if action > eps:   # Charge
             desired_power = min(action * max_charge, max_charge)
             if desired_power > eps:
-                soc_factor = max(0, (self.soc_target - self.soc) * 0.3)
-                bid_price = price_now * (1.0 + soc_factor) + 5
+                # Bid must strictly exceed ext_grid's ask (price + ext_margin_buy = price + 1)
+                # to create positive welfare and guarantee the optimizer allocates to us.
+                # Using +3 (> ext_margin_buy of 1) ensures a strict welfare gain.
+                lec_min = self.model.gridfee_LEC + self.model.levies_LEC
+                bid_price = max(price_now + 3.0, lec_min + 3.0)
                 bid_fun = self.offer_function(bid_price)
                 self.bid = [0, desired_power, bid_fun, "lin"]
                 self.coefficients_bid = [0, bid_price * (self.model.timestep.seconds / 3600)]
-        
-        elif action < -eps:  # Discharge
+
+        elif action < -eps:   # Discharge
             desired_power = min(-action * max_discharge, max_safe_discharge)
-            if desired_power > eps and self.soc > 0.28:
-                # SENSIBLE ask price: close to spot for actual profit
-                ask_price = price_now * 0.92
+            if desired_power > eps:
+                # Ask must be below ext_grid's bid (price - ext_margin_sell = price - 0.3)
+                # so the optimizer sees positive welfare from the trade.
+                # Flat -1.0 Ct/kWh below spot guarantees this for all realistic prices.
+                ask_price = max(price_now - 1.0, 0.01)
                 ask_fun = self.offer_function(ask_price)
                 self.ask = [0, desired_power, ask_fun, "lin"]
                 self.coefficients_ask = [0, ask_price * (self.model.timestep.seconds / 3600)]
 
     
     def compute_reward(self, bought, sold, price):
-        """Simplified reward function using spot price."""
+        """Reward function with three components.
+
+        Components are scaled to roughly the same order of magnitude so the
+        agent can learn price-timing without being overwhelmed by SOC alarms.
+
+        1. profit_reward   — financially accurate primary signal
+        2. arbitrage_bonus — additive-only timing nudge (no double-penalising)
+        3. soc_penalty     — safety guardrail, max ≈ -3 (not -20)
+        4. soc_bonus       — smooth taper encouraging mid-range SOC
+        """
         avg_price = self.get_average_price(24)
-        
+        price_ratio = price / (avg_price + 1e-6)
+
+        # 1. Primary: actual financial cost/profit (scaled ×5 for magnitude)
         energy_cost_eur = price * (bought - sold) / 100
         profit_reward = -energy_cost_eur * 5.0
 
-        arbitrage_reward = 0.0
-        
+        # 2. Timing bonus only — no penalty (profit_reward already handles the downside)
+        arbitrage_bonus = 0.0
         if bought > 0.1:
-            price_ratio = price / avg_price
             if price_ratio < 0.75:
-                arbitrage_reward += 3.0
+                arbitrage_bonus += 1.0
             elif price_ratio < 0.90:
-                arbitrage_reward += 1.5
-            elif price_ratio > 1.10:
-                arbitrage_reward -= 2.0
-            elif price_ratio > 1.25:
-                arbitrage_reward -= 4.0
-        
+                arbitrage_bonus += 0.5
         if sold > 0.1:
-            price_ratio = price / avg_price
             if price_ratio > 1.25:
-                arbitrage_reward += 3.0
+                arbitrage_bonus += 1.0
             elif price_ratio > 1.10:
-                arbitrage_reward += 1.5
-            elif price_ratio < 0.90:
-                arbitrage_reward -= 2.0
-            elif price_ratio < 0.75:
-                arbitrage_reward -= 4.0
-        
+                arbitrage_bonus += 0.5
+
+        # 3. SOC safety penalty — scaled to not dwarf the profit signal
         soc_penalty = 0.0
         if self.soc < 0.15:
-            soc_penalty = -20.0 * (0.15 - self.soc) / 0.15
+            soc_penalty = -3.0 * (0.15 - self.soc) / 0.15   # max -3.0 at soc=0
         elif self.soc > 0.90:
-            soc_penalty = -10.0 * (self.soc - 0.90) / 0.10
-        
-        soc_bonus = 1.0 if 0.30 <= self.soc <= 0.70 else 0.0
-        
-        return profit_reward + arbitrage_reward + soc_penalty + soc_bonus
+            soc_penalty = -2.0 * (self.soc - 0.90) / 0.10   # max -2.0 at soc=1
+
+        # 4. SOC centering bonus — smooth taper peaking at 0.50, zero at 0.25/0.75
+        soc_bonus = max(0.0, 1.0 - abs(self.soc - 0.50) / 0.25)
+
+        return profit_reward + arbitrage_bonus + soc_penalty + soc_bonus
 
     
     def update_status(self):
@@ -833,7 +848,10 @@ class storage(mesa.Agent):
         
         bought = result["Energy bought [kWh]"].to_numpy()[0]
         sold = result["Energy sold [kWh]"].to_numpy()[0]
-        
+        # DEBUG — remove once trading is confirmed
+        if self.method == "learning" and self.model.stepcount <= 4:
+            print(f"[DBG update step={int(self.model.stepcount)}] bought={bought:.4f} kWh sold={sold:.4f} kWh", flush=True)
+
         old_soc = self.soc
         energy_delta = bought * self.efficiency - sold / self.efficiency
         soc_delta = energy_delta / self.capacity
@@ -842,43 +860,46 @@ class storage(mesa.Agent):
         if self.method == "learning":
             self.cumulative_bought += bought
             self.cumulative_sold += sold
-            
+
             self.soc_history.append(self.soc)
-            if len(self.soc_history) > 2000:
-                self.soc_history = self.soc_history[-2000:]
-            
+
+            # Add observed price to rolling window (used by get_average_price / get_price_percentile)
+            price = self.get_current_price()
+            self.price_history.append(price)
+
             if self.last_state is not None and self.last_action is not None:
-                price = self.get_current_price()
-                
+
                 actual_cost = price * (bought - sold) / 100
                 self.cumulative_profit -= actual_cost
-                
+
                 reward = self.compute_reward(bought, sold, price)
                 self.cumulative_reward += reward
-                
+
                 next_state = self.build_state()
 
                 self.memory.append((
                     self.last_state,
                     self.last_action,
+                    self.last_raw_action,   # raw tanh(z) — used for correct gradient computation
                     reward,
                     next_state,
-                    self.last_hidden,
-                    self.soc
+                    self.last_hidden,       # post-activation h1 (ndarray)
+                    self.last_h1_in,        # pre-activation h1_in — needed for LeakyReLU derivative
+                    self.soc,
                 ))
-                
+
                 self.last_state = next_state
 
                 if self.model.stepcount % self.update_frequency == 0:
                     self.episode_counter += 1
                     self.update_parameters()
-                    
+
                     self._print_episode_summary()
                     self._log_episode()
                     self._reset_episode_counters()
 
     def _print_episode_summary(self):
-        recent_soc = self.soc_history[-96:] if len(self.soc_history) >= 96 else self.soc_history
+        recent_soc = list(self.soc_history)[-96:] if len(self.soc_history) >= 96 else list(self.soc_history)
         avg_soc = np.mean(recent_soc) if recent_soc else self.soc
         min_soc = np.min(recent_soc) if recent_soc else self.soc
         max_soc = np.max(recent_soc) if recent_soc else self.soc
@@ -899,20 +920,23 @@ class storage(mesa.Agent):
         print(f"  SOC Range (24h):     {min_soc*100:>6.1f}% - {max_soc*100:.1f}%")
         print(f"  Avg SOC (24h):       {avg_soc*100:>12.1f}%")
         print(f"  Avg TD Error:        {avg_td_error:>12.4f}")
-        print(f"{'='*60}")
-        
+        print(f"{'='*60}", flush=True)
+
         if self.cumulative_profit > self.best_profit:
             self.best_profit = self.cumulative_profit
             self.best_theta = {
-                "layer1": {k: v for k, v in self.theta["layer1"].items()},
-                "layer2": {k: v for k, v in self.theta["layer2"].items()}
+                "W1": self.theta["W1"].copy(),
+                "b1": self.theta["b1"].copy(),
+                "W2": self.theta["W2"].copy(),
+                "b2": self.theta["b2"].copy(),
             }
-            print(f"  *** New best profit: €{self.best_profit:.4f} ***")
+            print(f"  *** New best profit: €{self.best_profit:.4f} ***", flush=True)
 
     def _log_episode(self):
         """Log episode to JSON file."""
-        recent_soc = self.soc_history[-96:] if len(self.soc_history) >= 96 else self.soc_history
-        
+        recent_soc = list(self.soc_history)[-96:] if len(self.soc_history) >= 96 else list(self.soc_history)
+        soc_arr = np.array(recent_soc) if recent_soc else np.array([self.soc])
+
         episode_log = {
             "agent_id": int(self.unique_id),
             "episode": int(self.episode_counter),
@@ -923,22 +947,28 @@ class storage(mesa.Agent):
             "energy_sold_kwh": round(float(self.cumulative_sold), 4),
             "exploration_rate": round(float(self.exploration_rate), 6),
             "avg_td_error": round(float(np.mean(self.td_errors[-100:])) if self.td_errors else 0, 4),
+            "soc_avg": round(float(np.mean(soc_arr)), 4),
+            "soc_min": round(float(np.min(soc_arr)), 4),
+            "soc_max": round(float(np.max(soc_arr)), 4),
             "theta": {
-                "layer1": {k: round(float(v), 6) for k, v in self.theta["layer1"].items()},
-                "layer2": {k: round(float(v), 6) for k, v in self.theta["layer2"].items()},
+                "W1": [[round(float(v), 6) for v in row] for row in self.theta["W1"]],
+                "b1": [round(float(v), 6) for v in self.theta["b1"]],
+                "W2": [round(float(v), 6) for v in self.theta["W2"]],
+                "b2": [round(float(v), 6) for v in self.theta["b2"]],
             },
             "value_theta": {k: round(float(v), 6) for k, v in self.value_theta.items()},
         }
         
         try:
-            with open("episode_logs.jsonl", "a") as f:
+            log_path = os.path.join("output", "episode_logs.jsonl")
+            os.makedirs("output", exist_ok=True)
+            with open(log_path, "a") as f:
                 f.write(json.dumps(episode_log) + "\n")
         except Exception as e:
             print(f"[Warning] Failed to write episode log: {e}")
 
     def _reset_episode_counters(self):
         """Reset episode counters."""
-        self.episode_rewards.append(self.cumulative_reward)
         self.episode_profits.append(self.cumulative_profit)
         
         self.cumulative_reward = 0
@@ -949,130 +979,117 @@ class storage(mesa.Agent):
         self.exploration_rate *= self.exploration_decay
         self.exploration_rate = max(self.exploration_rate, self.min_exploration)
     
+    def _sample_batch(self):
+        """Sample a random mini-batch from memory."""
+        indices = np.random.choice(len(self.memory), self.batch_size, replace=False)
+        return [self.memory[i] for i in indices]
+
+    def _critic_gradient_step(self, batch):
+        """Compute and apply one critic gradient update. Returns list of TD errors."""
+        grad_value = {k: 0.0 for k in self.value_theta}
+        td_errors = []
+
+        for transition in batch:
+            state, action, raw_action, reward, next_state, h1, h1_in, soc = transition
+
+            # State layout: [soc, price_norm, price_diff_1h, price_diff_4h,
+            #                sin_hour, cos_hour, sin_dow, cos_dow, price_percentile]
+            soc_state  = state[0]
+            price_norm = state[1]
+            price_diff = state[2]
+            sin_hour   = state[4]
+
+            V_current = self.estimate_value(state)
+            V_next    = self.estimate_value(next_state)
+            td_error  = reward + self.gamma * V_next - V_current
+            td_errors.append(td_error)
+
+            grad_value["soc_w"]        += td_error * (soc_state - self.soc_target)
+            grad_value["soc_sq_w"]     += td_error * ((soc_state - self.soc_target) ** 2)
+            grad_value["price_w"]      += td_error * price_norm
+            grad_value["price_diff_w"] += td_error * price_diff
+            grad_value["hour_w"]       += td_error * sin_hour
+            grad_value["bias"]         += td_error
+
+        max_grad = 0.5
+        for key in self.value_theta:
+            grad = np.clip(grad_value[key] / self.batch_size, -max_grad, max_grad)
+            self.value_theta[key] += self.critic_lr * grad
+
+        return td_errors
+
     def update_parameters(self):
         if len(self.memory) < self.batch_size:
             return
-        
-        # Sample random batch
-        batch_indices = np.random.choice(len(self.memory), self.batch_size, replace=False)
-        batch = [self.memory[i] for i in batch_indices]
-        
-        # Initialize gradients
-        grad_layer1 = {k: 0.0 for k in self.theta["layer1"]}
-        grad_layer2 = {k: 0.0 for k in self.theta["layer2"]}
-        grad_value = {k: 0.0 for k in self.value_theta}
-        
-        td_errors = []
-        
+
+        max_grad = 0.5
+
+        # ── Critic: 5 independent updates before the actor step ───────────
+        # Running more critic updates ensures the value function is a good
+        # baseline before the actor gradient uses it as an advantage signal.
+        all_td_errors = []
+        for _ in range(5):
+            td_errors = self._critic_gradient_step(self._sample_batch())
+            all_td_errors.extend(td_errors)
+
+        # ── Actor: 1 update using the now-improved critic ─────────────────
+        batch = self._sample_batch()
+
+        grad_W1 = np.zeros_like(self.theta["W1"])
+        grad_b1 = np.zeros_like(self.theta["b1"])
+        grad_W2 = np.zeros_like(self.theta["W2"])
+        grad_b2 = np.zeros_like(self.theta["b2"])
+
+        actor_td_errors = []
         for transition in batch:
-            state, action, reward, next_state, h1, soc = transition
-            
-            # Extract state features
-            soc_state = state[0]
-            price_norm = state[3]
-            price_diff = state[4]
-            hour_norm = state[6]
-            
-            # ============================================================
-            # COMPUTE TD ERROR (This is the key change!)
-            # ============================================================
-            # TD Error: δ = r + γV(s') - V(s)
-            #
-            # Instead of comparing to batch average (which ignores state),
-            # we compare to what we EXPECTED from this state.
-            
+            state, action, raw_action, reward, next_state, h1, h1_in, soc = transition
+
             V_current = self.estimate_value(state)
-            V_next = self.estimate_value(next_state)
-            
-            td_error = reward + self.gamma * V_next - V_current
-            td_errors.append(td_error)
-            
-            # The TD error IS the advantage!
-            # Positive TD error = better than expected = reinforce action
-            # Negative TD error = worse than expected = discourage action
+            V_next    = self.estimate_value(next_state)
+            td_error  = reward + self.gamma * V_next - V_current
+            actor_td_errors.append(td_error)
             advantage = td_error
-            
-            # ============================================================
-            # UPDATE CRITIC (Value Function)
-            # ============================================================
-            # Move V(s) toward the TD target: r + γV(s')
-            # Gradient: ∂L/∂θ_v = -TD_error * ∂V/∂θ_v
-            
-            grad_value["soc_w"] += td_error * (soc_state - self.soc_target)
-            grad_value["soc_sq_w"] += td_error * ((soc_state - self.soc_target) ** 2)
-            grad_value["price_w"] += td_error * price_norm
-            grad_value["price_diff_w"] += td_error * price_diff
-            grad_value["hour_w"] += td_error * hour_norm
-            grad_value["bias"] += td_error
-            
-            # ============================================================
-            # UPDATE ACTOR (Policy)
-            # ============================================================
-            # Same as before, but using TD error as advantage
-            
-            # Gradient of tanh
-            grad_output = advantage * (1 - action**2)
-            
-            # Backprop through LeakyReLU
-            leaky_relu_deriv = 1.0 if h1 > 0 else 0.1
-            grad_hidden = grad_output * self.theta["layer2"]["hidden_w"] * leaky_relu_deriv
-            
-            # Accumulate gradients
-            grad_layer2["hidden_w"] += grad_output * h1
-            grad_layer2["bias"] += grad_output
-            
-            grad_layer1["soc_w"] += grad_hidden * (soc_state - self.soc_target)
-            grad_layer1["price_w"] += grad_hidden * price_norm
-            grad_layer1["price_diff_w"] += grad_hidden * price_diff
-            grad_layer1["forecast_1h_w"] += grad_hidden * price_diff
-            grad_layer1["forecast_4h_w"] += grad_hidden * state[5] 
-            grad_layer1["time_w"] += grad_hidden * hour_norm
-            grad_layer1["dow_w"] += grad_hidden * state[7] 
-            grad_layer1["bias"] += grad_hidden
-        
-        # Store TD errors for monitoring
-        self.td_errors.extend(td_errors)
-        if len(self.td_errors) > 1000:
-            self.td_errors = self.td_errors[-1000:]
-        
-        # Adaptive learning rate for actor
+
+            # Tanh derivative evaluated at raw network output (before bias/noise)
+            dz = advantage * (1.0 - raw_action ** 2)
+
+            grad_W2 += dz * h1
+            grad_b2 += dz
+
+            leaky_deriv = np.where(h1_in > 0, 1.0, 0.1)
+            delta_h = dz * self.theta["W2"] * leaky_deriv
+            x = np.array(state, dtype=float)
+            grad_W1 += np.outer(delta_h, x)
+            grad_b1 += delta_h
+
+        # Adaptive actor learning rate
         actor_lr = self.actor_lr
         if len(self.episode_profits) >= 4:
             recent = np.mean(self.episode_profits[-2:])
-            older = np.mean(self.episode_profits[-4:-2])
-            if recent > older:
-                actor_lr *= 1.1
-            else:
-                actor_lr *= 0.9
-            actor_lr = np.clip(actor_lr, 0.01, 0.08)
-        
-        max_grad = 0.5
-        
-        # Update Critic (Value Function)
-        for key in self.value_theta:
-            grad = grad_value[key] / self.batch_size
-            grad = np.clip(grad, -max_grad, max_grad)
-            self.value_theta[key] += self.critic_lr * grad
-        
-        # Update Actor (Policy)
-        for key in self.theta["layer1"]:
-            grad = grad_layer1[key] / self.batch_size
-            grad = np.clip(grad, -max_grad, max_grad)
-            self.theta["layer1"][key] += actor_lr * grad
-        
-        for key in self.theta["layer2"]:
-            grad = grad_layer2[key] / self.batch_size
-            grad = np.clip(grad, -max_grad, max_grad)
-            self.theta["layer2"][key] += actor_lr * grad
-        
+            older  = np.mean(self.episode_profits[-4:-2])
+            actor_lr *= 1.1 if recent > older else 0.9
+            actor_lr = float(np.clip(actor_lr, 0.01, 0.08))
 
-        avg_td = np.mean(td_errors)
-        std_td = np.std(td_errors)
+        self.theta["W1"] += actor_lr * np.clip(grad_W1 / self.batch_size, -max_grad, max_grad)
+        self.theta["b1"] += actor_lr * np.clip(grad_b1 / self.batch_size, -max_grad, max_grad)
+        self.theta["W2"] += actor_lr * np.clip(grad_W2 / self.batch_size, -max_grad, max_grad)
+        self.theta["b2"] += actor_lr * np.clip(grad_b2 / self.batch_size, -max_grad, max_grad)
+
+        # ── Weight decay: prevent W1/W2 from growing into tanh saturation ─
+        self.theta["W1"] *= 0.999
+        self.theta["W2"] *= 0.999
+
+        # ── Store TD errors for monitoring ────────────────────────────────
+        self.td_errors.extend(all_td_errors)
+        if len(self.td_errors) > 1000:
+            self.td_errors = self.td_errors[-1000:]
+
+        avg_td = float(np.mean(all_td_errors))
+        std_td = float(np.std(all_td_errors))
         print(f"[Storage {self.unique_id}] Updated (actor_lr={actor_lr:.4f}, critic_lr={self.critic_lr:.4f})")
         print(f"  TD Error: mean={avg_td:.3f}, std={std_td:.3f}")
-        print(f"  Actor L1: soc={self.theta['layer1']['soc_w']:.3f}, price={self.theta['layer1']['price_w']:.3f}")
-        print(f"  Actor L2: hidden={self.theta['layer2']['hidden_w']:.3f}, bias={self.theta['layer2']['bias']:.3f}")
-        print(f"  Critic: soc={self.value_theta['soc_w']:.3f}, price={self.value_theta['price_w']:.3f}, bias={self.value_theta['bias']:.3f}")
+        print(f"  W2 (output weights): {np.round(self.theta['W2'], 3)}")
+        print(f"  Critic: soc={self.value_theta['soc_w']:.3f}, price={self.value_theta['price_w']:.3f}, bias={self.value_theta['bias']:.3f}", flush=True)
 
     
     def offer_function(self, price):
@@ -1125,13 +1142,21 @@ class storage(mesa.Agent):
             elif self.method == "learning":
                 # RL-based bidding
                 state = self.build_state()
-                action, hidden = self.policy(state)
-                
-                self.last_state = state
-                self.last_action = action
-                self.last_hidden = hidden
-                
+                action, raw_action, hidden, h1_in = self.policy(state)
+
+                self.last_state      = state
+                self.last_action     = action
+                self.last_raw_action = raw_action
+                self.last_hidden     = hidden
+                self.last_h1_in      = h1_in
+
                 self.action_to_bid(action)
+                # DEBUG — remove once trading is confirmed
+                if self.model.stepcount <= 3:
+                    price_now = self.get_current_price()
+                    print(f"[DBG step={int(self.model.stepcount)}] action={action:.3f} soc={self.soc:.3f} "
+                          f"price={price_now:.2f} bid_pmax={self.bid[1]:.4f} ask_pmax={self.ask[1]:.4f} "
+                          f"bid_coef={self.coefficients_bid} ask_coef={self.coefficients_ask}", flush=True)
 
 #-------------------------------------------------------------------------------------------
 class EV(mesa.Agent):

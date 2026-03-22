@@ -446,8 +446,27 @@ class MarketOptimizer:
                 m.p_ask[j].setub(0.0)
                    
 
+        # DEBUG — find storage agent's bid index and inspect bounds before solving
+        storage_bid_idx = next((i for i in m.BIDS if m.id_bid[i] == 28), None)
+        if storage_bid_idx is not None and not hasattr(self, '_dbg_count'):
+            self._dbg_count = 0
+        if storage_bid_idx is not None and getattr(self, '_dbg_count', 0) < 4:
+            pmax_param = value(m.pbid_max[storage_bid_idx])
+            var_ub = m.p_bid[storage_bid_idx].ub
+            b_coef = value(m.b_bid[storage_bid_idx])
+            print(f"[PRE-SOLVE dbg #{self._dbg_count}] storage bid_idx={storage_bid_idx} "
+                  f"pbid_max_param={pmax_param:.4f} var.ub={var_ub} b_bid={b_coef:.4f}", flush=True)
+
         solver = self._solver_instance
         self.result = solver.solve(m, tee=False)
+        # DEBUG — check result
+        tc = self.result.solver.termination_condition
+        if str(tc) != "optimal":
+            print(f"[SOLVER] termination={tc}", flush=True)
+        if storage_bid_idx is not None and getattr(self, '_dbg_count', 0) < 4:
+            p_storage = value(m.p_bid[storage_bid_idx])
+            print(f"[POST-SOLVE dbg #{self._dbg_count}] tc={tc} p_bid[storage]={p_storage:.5f}", flush=True)
+            self._dbg_count += 1
 
         if hasattr(solver, '_solver_model') and solver._solver_model is not None:
             try:

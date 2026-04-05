@@ -301,3 +301,76 @@ Applied to the "buy/sell action"
 | `min_exploration` | 0.08 | Minimum noise level |
 
 ---
+
+## 8. What We Are Contributing — TD Actor-Critic (`algo/temporal-difference`)
+
+The original implementation used a Monte Carlo policy gradient: weights were updated once per episode using the full cumulative return. This branch replaces it with a **Temporal Difference (TD) Actor-Critic**, which bootstraps value estimates at every timestep and produces much faster, lower-variance learning.
+
+### 8.1 From Monte Carlo to TD Actor-Critic
+
+| Property | Monte Carlo (old) | TD Actor-Critic (this branch) |
+|----------|------------------|-------------------------------|
+| Update frequency | Once per episode (end of day) | Every timestep (online) |
+| Return estimate | Full rollout `G_t` | Bootstrapped: `r + γ·V(s')` |
+| Variance | High | Low |
+| Bias | None | Small (from bootstrapping) |
+| Separate critic | No | Yes — linear value function |
+
+### 8.2 The Critic (Value Function)
+
+A linear critic approximates how good each state is. It is trained separately from the actor:
+
+```python
+V(s) = soc_w × (soc - target)
+     + soc_sq_w × (soc - target)²
+     + price_w × price_norm
+     + price_diff_w × price_diff
+     + hour_w × sin(hour)
+     + bias
+```
+
+Warm-started with `soc_sq_w = -1.0` so the critic immediately penalises extreme SOC states before any learning has occurred.
+
+### 8.3 The TD Update Rule
+
+At each timestep the TD error `δ` measures how wrong the critic's prediction was:
+
+```
+δ = r + γ·V(s') - V(s)        ← TD error (prediction error)
+
+critic: θ_v += critic_lr · δ · ∇V(s)    ← make prediction more accurate
+actor:  θ_π += actor_lr · δ · ∇log π    ← reinforce good actions
+```
+
+A positive `δ` means the outcome was better than expected → the actor is nudged toward the action that caused it. A negative `δ` discourages that action.
+
+### 8.4 Network Architecture Changes
+
+The hidden layer was widened from **1 neuron to 4 neurons** to allow the policy to learn interactions between features (e.g. "low price AND rising forecast AND low SOC → strong buy"):
+
+```
+Input (9) → W1 [4×9] + b1 [4] → LeakyReLU → W2 [1×4] + b2 [1] → Tanh → action
+```
+
+Weights are stored as numpy arrays (`W1`, `b1`, `W2`, `b2`) rather than the old named-key dict.
+
+### 8.5 Bug Fixes & Design Improvements
+
+Several bugs were found and fixed during this branch:
+
+| # | Bug | Fix |
+|---|-----|-----|
+| 1 | `value_theta` missing `"bias"` key → critic crashed every run | Added `"bias": 0.0` with warm-start |
+| 2 | Two weights both received `price_diff_1h` → redundant, one weight never learned | Corrected to separate `price_diff` and `forecast_1h` inputs |
+| 3 | `get_average_price` sliced a static array → data leakage from future prices | Replaced with a rolling `price_history` deque (only seen prices) |
+| 4 | Tanh gradient used the post-processed (clipped) action → wrong gradient | Stored `raw_action = tanh(z)` separately; gradient computed from that |
+
+Additional design improvements:
+
+- **Ask price:** changed from `price × 0.92` (always underselling) to `price × (1.0 + 0.05 × |action|)` — the agent now sells at or above market
+- **SOC penalty:** reduced maximum from −20 to −3 and replaced hard steps with a smooth taper, reducing reward spikes that disrupted learning
+- **Bias blend in policy:** reduced from 40% to 10% — the network now dominates over the hand-coded prior, improving credit assignment
+- **Weight decay:** `W1 × 0.999` and `W2 × 0.999` each update, preventing weights from growing into tanh saturation
+- **Adaptive actor learning rate:** scales between 0.01–0.08 based on whether recent profits exceed older profits
+
+---

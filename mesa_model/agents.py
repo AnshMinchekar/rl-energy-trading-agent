@@ -508,8 +508,8 @@ class storage(mesa.Agent):
             
             # SOC operating range
             self.soc_floor = 0.10
-            self.soc_ceiling = 0.75
-            self.soc_target = 0.45
+            self.soc_ceiling = 0.85
+            self.soc_target = 0.50
             
             # Price cache (for fast point lookups and forecasts)
             self._price_index = None
@@ -678,21 +678,17 @@ class storage(mesa.Agent):
         action = raw_action
 
         # --- Soft biases (10% influence — reduced from 40% to limit credit-assignment noise) ---
+        # Soft SOC biases — only activate at true extremes so the learned policy dominates
+        # in the normal trading range (10–85%). Biases match the updated soc_ceiling of 0.85.
         soc_bias = 0.0
-        if soc < 0.15:
-            soc_bias = 0.8
+        if soc < 0.12:
+            soc_bias = 0.8        # Very low SOC: push to charge hard
         elif soc < self.soc_floor:
-            soc_bias = 0.5 * (self.soc_floor - soc) / 0.10
-        elif soc < 0.35:
-            soc_bias = 0.2
-        elif soc > 0.85:
-            soc_bias = -0.8
+            soc_bias = 0.4
+        elif soc > 0.93:
+            soc_bias = -0.8       # Very high SOC: push to discharge hard
         elif soc > self.soc_ceiling:
             soc_bias = -0.5 * (soc - self.soc_ceiling) / 0.10
-        elif soc > 0.60:
-            soc_bias = -0.3
-        elif soc > self.soc_target:
-            soc_bias = -0.1
 
         price_bias = 0.0
         if price_percentile < 0.15:
@@ -767,11 +763,11 @@ class storage(mesa.Agent):
         if action > eps:   # Charge
             desired_power = min(action * max_charge, max_charge)
             if desired_power > eps:
-                # Bid must strictly exceed ext_grid's ask (price + ext_margin_buy = price + 1)
-                # to create positive welfare and guarantee the optimizer allocates to us.
-                # Using +3 (> ext_margin_buy of 1) ensures a strict welfare gain.
+                # Bid must strictly exceed ext_grid's ask (price + ext_margin_buy ≈ price + 1)
+                # to get allocated. Use +1.2 (just above the margin) to minimise overpay.
+                # Old value was +3.0 which created a guaranteed 3 Ct/kWh loss on every purchase.
                 lec_min = self.model.gridfee_LEC + self.model.levies_LEC
-                bid_price = max(price_now + 3.0, lec_min + 3.0)
+                bid_price = max(price_now + 1.2, lec_min + 1.2)
                 bid_fun = self.offer_function(bid_price)
                 self.bid = [0, desired_power, bid_fun, "lin"]
                 self.coefficients_bid = [0, bid_price * (self.model.timestep.seconds / 3600)]
@@ -780,9 +776,9 @@ class storage(mesa.Agent):
             desired_power = min(-action * max_discharge, max_safe_discharge)
             if desired_power > eps:
                 # Ask must be below ext_grid's bid (price - ext_margin_sell = price - 0.3)
-                # so the optimizer sees positive welfare from the trade.
-                # Flat -1.0 Ct/kWh below spot guarantees this for all realistic prices.
-                ask_price = max(price_now - 1.0, 0.01)
+                # Use -0.4 (just below the ext_grid's bid) to maximise sale revenue.
+                # Old value was -1.0 which surrendered 0.7 Ct/kWh on every sale unnecessarily.
+                ask_price = max(price_now - 0.4, 0.01)
                 ask_fun = self.offer_function(ask_price)
                 self.ask = [0, desired_power, ask_fun, "lin"]
                 self.coefficients_ask = [0, ask_price * (self.model.timestep.seconds / 3600)]
@@ -796,8 +792,7 @@ class storage(mesa.Agent):
 
         1. profit_reward   — financially accurate primary signal
         2. arbitrage_bonus — additive-only timing nudge (no double-penalising)
-        3. soc_penalty     — safety guardrail, max ≈ -3 (not -20)
-        4. soc_bonus       — smooth taper encouraging mid-range SOC
+        3. soc_penalty     — safety guardrail, only at true extremes (soc<0.10 or >0.92)
         """
         avg_price = self.get_average_price(24)
         price_ratio = price / (avg_price + 1e-6)
@@ -806,30 +801,34 @@ class storage(mesa.Agent):
         energy_cost_eur = price * (bought - sold) / 100
         profit_reward = -energy_cost_eur * 5.0
 
-        # 2. Timing bonus only — no penalty (profit_reward already handles the downside)
+        # 2. Timing bonus — broader price thresholds so good-but-not-extreme trades are rewarded
         arbitrage_bonus = 0.0
         if bought > 0.1:
-            if price_ratio < 0.75:
+            if price_ratio < 0.70:
+                arbitrage_bonus += 2.0
+            elif price_ratio < 0.85:
                 arbitrage_bonus += 1.0
-            elif price_ratio < 0.90:
-                arbitrage_bonus += 0.5
+            elif price_ratio < 0.95:
+                arbitrage_bonus += 0.3
         if sold > 0.1:
-            if price_ratio > 1.25:
+            if price_ratio > 1.30:
+                arbitrage_bonus += 2.0
+            elif price_ratio > 1.15:
                 arbitrage_bonus += 1.0
-            elif price_ratio > 1.10:
-                arbitrage_bonus += 0.5
+            elif price_ratio > 1.05:
+                arbitrage_bonus += 0.3
 
-        # 3. SOC safety penalty — scaled to not dwarf the profit signal
+        # 3. SOC safety penalty — only at true extremes, does not overlap trading range
         soc_penalty = 0.0
-        if self.soc < 0.15:
-            soc_penalty = -3.0 * (0.15 - self.soc) / 0.15   # max -3.0 at soc=0
-        elif self.soc > 0.90:
-            soc_penalty = -2.0 * (self.soc - 0.90) / 0.10   # max -2.0 at soc=1
+        if self.soc < 0.10:
+            soc_penalty = -2.0 * (0.10 - self.soc) / 0.10   # max -2.0 at soc=0
+        elif self.soc > 0.92:
+            soc_penalty = -2.0 * (self.soc - 0.92) / 0.08   # max -2.0 at soc=1
 
-        # 4. SOC centering bonus — smooth taper peaking at 0.50, zero at 0.25/0.75
-        soc_bonus = max(0.0, 1.0 - abs(self.soc - 0.50) / 0.25)
+        # NOTE: soc_bonus removed — it rewarded inaction (maintaining soc≈0.5 without trading)
+        # and overwhelmed the profit signal. The profit_reward + arbitrage_bonus are sufficient.
 
-        return profit_reward + arbitrage_bonus + soc_penalty + soc_bonus
+        return profit_reward + arbitrage_bonus + soc_penalty
 
     
     def update_status(self):
@@ -1032,7 +1031,7 @@ class storage(mesa.Agent):
             td_errors = self._critic_gradient_step(self._sample_batch())
             all_td_errors.extend(td_errors)
 
-        # ── Actor: 1 update using the now-improved critic ─────────────────
+        #Actor: 1 update using the now-improved critic 
         batch = self._sample_batch()
 
         grad_W1 = np.zeros_like(self.theta["W1"])

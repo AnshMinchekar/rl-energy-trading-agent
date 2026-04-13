@@ -441,17 +441,14 @@ class storage(mesa.Agent):
         if self.method == "learning":
             self.soc = config.storage["SOC_start"]
             
-            # 4-neuron hidden layer stored as numpy arrays.
+            # 8-neuron hidden layer stored as numpy arrays.
             # Input order: [soc, price_norm, price_diff_1h, price_diff_4h,
             #               sin_hour, cos_hour, sin_dow, cos_dow, price_percentile]
             # (max_discharge and max_charge removed — fully determined by soc)
             # (hour/dow replaced by sin/cos pairs for continuous circular encoding)
-            # Neuron intuitions:
-            #   0 – price-timing:   sell high-price/high-SOC, buy low-price/low-SOC
-            #   1 – SOC management: charge when low, discharge when high
-            #   2 – forecast:       react to upcoming price changes
-            #   3 – time-of-day:    capture daily demand cycles via circular time
-            n_hidden, n_inputs = 4, 9
+            # 8 neurons gives more capacity to learn the joint (soc × price × time) arbitrage
+            # signal that 4 neurons were too constrained to represent simultaneously.
+            n_hidden, n_inputs = 8, 9
             # Small random initialization so gradients can flow from the start.
             # Scale 0.1 keeps the initial policy output near-neutral (±0.1 range)
             # so the soc/price biases drive early exploration, but non-zero h1 and
@@ -760,14 +757,22 @@ class storage(mesa.Agent):
         else:
             max_safe_discharge = 0
 
+        price_percentile = self.get_price_percentile()
+
         if action > eps:   # Charge
             desired_power = min(action * max_charge, max_charge)
             if desired_power > eps:
-                # Bid must strictly exceed ext_grid's ask (price + ext_margin_buy ≈ price + 1)
-                # to get allocated. Use +1.2 (just above the margin) to minimise overpay.
-                # Old value was +3.0 which created a guaranteed 3 Ct/kWh loss on every purchase.
+                # Bid premium scales with price context:
+                # At low percentiles (genuinely cheap) → small premium to avoid overpaying.
+                # At mid/high percentiles → larger premium to ensure fill despite competition.
+                if price_percentile < 0.15:
+                    bid_premium = 0.5   # very cheap: don't overpay
+                elif price_percentile < 0.35:
+                    bid_premium = 0.8
+                else:
+                    bid_premium = 1.2   # default: need premium to beat ext_grid margin
                 lec_min = self.model.gridfee_LEC + self.model.levies_LEC
-                bid_price = max(price_now + 1.2, lec_min + 1.2)
+                bid_price = max(price_now + bid_premium, lec_min + bid_premium)
                 bid_fun = self.offer_function(bid_price)
                 self.bid = [0, desired_power, bid_fun, "lin"]
                 self.coefficients_bid = [0, bid_price * (self.model.timestep.seconds / 3600)]
@@ -775,10 +780,16 @@ class storage(mesa.Agent):
         elif action < -eps:   # Discharge
             desired_power = min(-action * max_discharge, max_safe_discharge)
             if desired_power > eps:
-                # Ask must be below ext_grid's bid (price - ext_margin_sell = price - 0.3)
-                # Use -0.4 (just below the ext_grid's bid) to maximise sale revenue.
-                # Old value was -1.0 which surrendered 0.7 Ct/kWh on every sale unnecessarily.
-                ask_price = max(price_now - 0.4, 0.01)
+                # Ask discount scales with price context:
+                # At high percentiles (genuinely expensive) → small discount to maximise revenue.
+                # At mid/low percentiles → larger discount to ensure sell is filled.
+                if price_percentile > 0.85:
+                    ask_discount = 0.1   # very expensive: stay near market to capture full price
+                elif price_percentile > 0.65:
+                    ask_discount = 0.25
+                else:
+                    ask_discount = 0.4   # default
+                ask_price = max(price_now - ask_discount, 0.01)
                 ask_fun = self.offer_function(ask_price)
                 self.ask = [0, desired_power, ask_fun, "lin"]
                 self.coefficients_ask = [0, ask_price * (self.model.timestep.seconds / 3600)]
@@ -801,22 +812,30 @@ class storage(mesa.Agent):
         energy_cost_eur = price * (bought - sold) / 100
         profit_reward = -energy_cost_eur * 5.0
 
-        # 2. Timing bonus — broader price thresholds so good-but-not-extreme trades are rewarded
+        # 2. Timing bonus — broader price thresholds so good-but-not-extreme trades are rewarded.
+        # Scaled by trade size so the agent is rewarded proportionally to commitment: a full-power
+        # trade at a good price earns the full bonus; a tiny hedge earns only a fraction.
+        max_energy_per_step = self.max_power * (self.model.timestep.seconds / 3600.0)  # kWh
         arbitrage_bonus = 0.0
-        if bought > 0.1:
+        if bought > 0.01:
             if price_ratio < 0.70:
                 arbitrage_bonus += 2.0
             elif price_ratio < 0.85:
                 arbitrage_bonus += 1.0
             elif price_ratio < 0.95:
                 arbitrage_bonus += 0.3
-        if sold > 0.1:
+            trade_size_norm = min(bought / (max_energy_per_step + 1e-6), 1.0)
+            arbitrage_bonus *= (0.3 + 0.7 * trade_size_norm)
+        if sold > 0.01:
+            sell_bonus = 0.0
             if price_ratio > 1.30:
-                arbitrage_bonus += 2.0
+                sell_bonus += 2.0
             elif price_ratio > 1.15:
-                arbitrage_bonus += 1.0
+                sell_bonus += 1.0
             elif price_ratio > 1.05:
-                arbitrage_bonus += 0.3
+                sell_bonus += 0.3
+            trade_size_norm = min(sold / (max_energy_per_step + 1e-6), 1.0)
+            arbitrage_bonus += sell_bonus * (0.3 + 0.7 * trade_size_norm)
 
         # 3. SOC safety penalty — only at true extremes, does not overlap trading range
         soc_penalty = 0.0
@@ -1040,14 +1059,26 @@ class storage(mesa.Agent):
         grad_b2 = np.zeros_like(self.theta["b2"])
 
         actor_td_errors = []
+        raw_advantages = []
+        actor_transitions = []
         for transition in batch:
             state, action, raw_action, reward, next_state, h1, h1_in, soc = transition
-
             V_current = self.estimate_value(state)
             V_next    = self.estimate_value(next_state)
             td_error  = reward + self.gamma * V_next - V_current
             actor_td_errors.append(td_error)
-            advantage = td_error
+            raw_advantages.append(td_error)
+            actor_transitions.append(transition)
+
+        # Normalize advantages across the batch so large TD spikes don't dominate the gradient.
+        adv_arr = np.array(raw_advantages)
+        adv_mean = float(np.mean(adv_arr))
+        adv_std  = float(np.std(adv_arr)) + 1e-8
+        normalized_advantages = (adv_arr - adv_mean) / adv_std
+
+        for i, transition in enumerate(actor_transitions):
+            state, action, raw_action, reward, next_state, h1, h1_in, soc = transition
+            advantage = float(normalized_advantages[i])
 
             # Tanh derivative evaluated at raw network output (before bias/noise)
             dz = advantage * (1.0 - raw_action ** 2)

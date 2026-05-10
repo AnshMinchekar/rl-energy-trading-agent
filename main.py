@@ -6,6 +6,11 @@ Created on Wed Oct  4 13:44:41 2023
 
 
 import gc
+import numpy as np
+import random
+np.random.seed(42)
+random.seed(42)
+
 from mesa_model.model import model
 from data.csv_writer import EntryWriter
 

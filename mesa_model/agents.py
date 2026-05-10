@@ -520,6 +520,12 @@ class storage(mesa.Agent):
             # TD learning tracking
             self.td_errors = []  # Track TD errors for debugging
 
+            # Trade tracking for episode logging
+            self.trade_count_buy = 0
+            self.trade_count_sell = 0
+            self.buy_price_sum = 0.0
+            self.sell_price_sum = 0.0
+
     
     def provide_a_power(self):
         """Calculate available charge/discharge power."""
@@ -908,6 +914,13 @@ class storage(mesa.Agent):
                 reward = self.compute_reward(bought, sold, price)
                 self.cumulative_reward += reward
 
+                if bought > 0.01:
+                    self.trade_count_buy += 1
+                    self.buy_price_sum += price
+                if sold > 0.01:
+                    self.trade_count_sell += 1
+                    self.sell_price_sum += price
+
                 next_state = self.build_state()
 
                 self.memory.append((
@@ -970,7 +983,11 @@ class storage(mesa.Agent):
         recent_soc = list(self.soc_history)[-96:] if len(self.soc_history) >= 96 else list(self.soc_history)
         soc_arr = np.array(recent_soc) if recent_soc else np.array([self.soc])
 
+        avg_buy_price = self.buy_price_sum / self.trade_count_buy if self.trade_count_buy > 0 else 0.0
+        avg_sell_price = self.sell_price_sum / self.trade_count_sell if self.trade_count_sell > 0 else 0.0
+
         episode_log = {
+            "algorithm": "td",
             "agent_id": int(self.unique_id),
             "episode": int(self.episode_counter),
             "timestamp": str(self.model.current_date),
@@ -983,6 +1000,10 @@ class storage(mesa.Agent):
             "soc_avg": round(float(np.mean(soc_arr)), 4),
             "soc_min": round(float(np.min(soc_arr)), 4),
             "soc_max": round(float(np.max(soc_arr)), 4),
+            "trade_count_buy": self.trade_count_buy,
+            "trade_count_sell": self.trade_count_sell,
+            "avg_buy_price": round(avg_buy_price, 4),
+            "avg_sell_price": round(avg_sell_price, 4),
             "theta": {
                 "W1": [[round(float(v), 6) for v in row] for row in self.theta["W1"]],
                 "b1": [round(float(v), 6) for v in self.theta["b1"]],
@@ -991,10 +1012,10 @@ class storage(mesa.Agent):
             },
             "value_theta": {k: round(float(v), 6) for k, v in self.value_theta.items()},
         }
-        
+
         try:
-            log_path = os.path.join("output", "episode_logs.jsonl")
-            os.makedirs("output", exist_ok=True)
+            log_path = os.path.join("output", "td", "episode_logs.jsonl")
+            os.makedirs(os.path.join("output", "td"), exist_ok=True)
             with open(log_path, "a") as f:
                 f.write(json.dumps(episode_log) + "\n")
         except Exception as e:
@@ -1003,12 +1024,16 @@ class storage(mesa.Agent):
     def _reset_episode_counters(self):
         """Reset episode counters."""
         self.episode_profits.append(self.cumulative_profit)
-        
+
         self.cumulative_reward = 0
         self.cumulative_profit = 0
         self.cumulative_bought = 0
         self.cumulative_sold = 0
-        
+        self.trade_count_buy = 0
+        self.trade_count_sell = 0
+        self.buy_price_sum = 0.0
+        self.sell_price_sum = 0.0
+
         self.exploration_rate *= self.exploration_decay
         self.exploration_rate = max(self.exploration_rate, self.min_exploration)
     

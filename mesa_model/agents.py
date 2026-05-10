@@ -697,11 +697,17 @@ class storage(mesa.Agent):
         elif price_percentile > 0.75:
             price_bias = -0.2
 
-        # 90% network / 10% bias so the learned policy dominates
-        action = 0.9 * action + 0.1 * (soc_bias + price_bias)
+        # Dynamic bias blend — stronger safety override at low SOC
+        if soc < 0.15:
+            bias_weight = 0.50
+        elif soc < 0.20:
+            bias_weight = 0.30
+        else:
+            bias_weight = 0.10
+        action = (1 - bias_weight) * action + bias_weight * (soc_bias + price_bias)
 
-        # --- Exploration noise ---
-        if 0.20 < soc < 0.90:
+        # --- Exploration noise (active at all SOC levels except hard ceiling) ---
+        if soc < 0.95:
             noise = np.random.normal(0, max(self.min_exploration, self.exploration_rate) * 0.4)
             action += noise
 
@@ -809,8 +815,13 @@ class storage(mesa.Agent):
         price_ratio = price / (avg_price + 1e-6)
 
         # 1. Primary: actual financial cost/profit (scaled ×5 for magnitude)
+        # At low SOC and non-expensive prices, halve the buying penalty to
+        # reduce aversion to recovery charging before price history is reliable.
         energy_cost_eur = price * (bought - sold) / 100
-        profit_reward = -energy_cost_eur * 5.0
+        penalty_scale = 5.0
+        if self.soc < 0.35 and bought > 0 and price_ratio < 1.1:
+            penalty_scale = 2.5
+        profit_reward = -energy_cost_eur * penalty_scale
 
         # 2. Timing bonus — broader price thresholds so good-but-not-extreme trades are rewarded.
         # Scaled by trade size so the agent is rewarded proportionally to commitment: a full-power
@@ -837,10 +848,14 @@ class storage(mesa.Agent):
             trade_size_norm = min(sold / (max_energy_per_step + 1e-6), 1.0)
             arbitrage_bonus += sell_bonus * (0.3 + 0.7 * trade_size_norm)
 
-        # 3. SOC safety penalty — only at true extremes, does not overlap trading range
+        # 3. SOC penalty — graded from 10–30% band up to hard floor
         soc_penalty = 0.0
         if self.soc < 0.10:
             soc_penalty = -2.0 * (0.10 - self.soc) / 0.10   # max -2.0 at soc=0
+        elif self.soc < 0.20:
+            soc_penalty = -0.8 * (0.20 - self.soc) / 0.10   # max -0.8 at soc=0.10
+        elif self.soc < 0.30:
+            soc_penalty = -0.3 * (0.30 - self.soc) / 0.10   # max -0.3 at soc=0.20
         elif self.soc > 0.92:
             soc_penalty = -2.0 * (self.soc - 0.92) / 0.08   # max -2.0 at soc=1
 

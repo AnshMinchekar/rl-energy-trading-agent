@@ -498,6 +498,15 @@ class storage(mesa.Agent):
             # Per-episode trajectory for true MC returns
             self.episode_buffer = []
 
+            # Trade tracking for episode logging
+            self.trade_count_buy = 0
+            self.trade_count_sell = 0
+            self.buy_price_sum = 0.0
+            self.sell_price_sum = 0.0
+            # Return stats set by update_parameters() for the log
+            self.last_avg_return = 0.0
+            self.last_return_std = 0.0
+
     def provide_a_power(self):
         a_power_discharge = min(
             max(self.soc - 0.05, 0) * self.capacity * 60 * 60 / self.model.timestep.seconds,
@@ -833,6 +842,13 @@ class storage(mesa.Agent):
 
                 self.episode_buffer.append((self.last_state, self.last_action, reward, self.last_hidden))
 
+                if bought > 0.01:
+                    self.trade_count_buy += 1
+                    self.buy_price_sum += price
+                if sold > 0.01:
+                    self.trade_count_sell += 1
+                    self.sell_price_sum += price
+
                 next_state = self.build_state()
                 self.memory.append((
                     self.last_state,
@@ -887,13 +903,10 @@ class storage(mesa.Agent):
                     
                     self.episode_rewards.append(self.cumulative_reward)
                     self.episode_profits.append(self.cumulative_profit)
-                    
-                    # Reset episode counters
-                    self.cumulative_reward = 0
-                    self.cumulative_profit = 0
-                    self.cumulative_bought = 0
-                    self.cumulative_sold = 0
-                    
+
+                    self._log_episode(avg_soc, min_soc, max_soc)
+                    self._reset_episode_counters()
+
                     self.exploration_rate *= self.exploration_decay
                     self.exploration_rate = max(self.exploration_rate, self.min_exploration)
 
@@ -910,6 +923,10 @@ class storage(mesa.Agent):
             G = reward + self.gamma * G
             returns.insert(0, G)
         returns = np.array(returns)
+
+        # Store raw stats for episode log before normalizing
+        self.last_avg_return = float(np.mean(returns))
+        self.last_return_std = float(np.std(returns))
 
         # Normalize to reduce variance
         if np.std(returns) > 1e-8:
@@ -969,6 +986,44 @@ class storage(mesa.Agent):
         print(f"[Storage {self.unique_id}] MC update: {n} steps, mean G={np.mean(returns):.4f}, std G={np.std(returns):.4f} (lr={lr:.4f})")
         print(f"  Layer 1 - SOC: {self.theta['layer1']['soc_w']:.4f}, Price: {self.theta['layer1']['price_w']:.4f}, Bias: {self.theta['layer1']['bias']:.4f}")
         print(f"  Layer 2 - Hidden: {self.theta['layer2']['hidden_w']:.4f}, Bias: {self.theta['layer2']['bias']:.4f}")
+
+    def _log_episode(self, soc_avg, soc_min, soc_max):
+        import json, os
+        os.makedirs("output/mc", exist_ok=True)
+        avg_buy_price = self.buy_price_sum / self.trade_count_buy if self.trade_count_buy > 0 else 0.0
+        avg_sell_price = self.sell_price_sum / self.trade_count_sell if self.trade_count_sell > 0 else 0.0
+        record = {
+            "algorithm": "mc",
+            "agent_id": int(self.unique_id),
+            "episode": self.episode_counter,
+            "timestamp": str(self.model.current_date),
+            "cumulative_reward": round(self.cumulative_reward, 4),
+            "actual_profit_eur": round(self.cumulative_profit, 4),
+            "energy_bought_kwh": round(self.cumulative_bought, 4),
+            "energy_sold_kwh": round(self.cumulative_sold, 4),
+            "exploration_rate": round(self.exploration_rate, 4),
+            "soc_avg": round(float(soc_avg), 4),
+            "soc_min": round(float(soc_min), 4),
+            "soc_max": round(float(soc_max), 4),
+            "trade_count_buy": self.trade_count_buy,
+            "trade_count_sell": self.trade_count_sell,
+            "avg_buy_price": round(avg_buy_price, 4),
+            "avg_sell_price": round(avg_sell_price, 4),
+            "avg_return": round(self.last_avg_return, 4),
+            "return_std": round(self.last_return_std, 4),
+        }
+        with open("output/mc/episode_logs.jsonl", "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def _reset_episode_counters(self):
+        self.cumulative_reward = 0
+        self.cumulative_profit = 0
+        self.cumulative_bought = 0
+        self.cumulative_sold = 0
+        self.trade_count_buy = 0
+        self.trade_count_sell = 0
+        self.buy_price_sum = 0.0
+        self.sell_price_sum = 0.0
 
     def offer_function(self, price):
         """Create offer function for market."""

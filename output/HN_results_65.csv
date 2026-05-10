@@ -1,4 +1,0 @@
-Date;Agent ID;Agent Type;SOC [rel];T ind. [C°];Energy Exchange Self-Supply [kWh];Energy Exchange LEC [kWh];Energy Exchange Retailer [kWh];Revenue Energy LEC [€];Revenue Energy Retailer [€];Fees and Levies LEC [€];Fees and Levies Retailer [€]
-01.01.2021 00:00;21;inflexible;None;None;0.0;0.0;0.0;0.0;0.0;0.0;0.0
-01.01.2021 00:00;28;BESS;0.25;None;-0.7012;-0.0;-0.0;-0.0;-0.0;-0.0;-0.0
-01.01.2021 00:00;13;inflexible;None;None;0.7012;-0.0;0.7283;-0.0;0.0443;-0.0;0.1143

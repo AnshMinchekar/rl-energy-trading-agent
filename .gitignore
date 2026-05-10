@@ -2,6 +2,11 @@
 .venv/
 .claude/
 
+# Simulation output (CSVs, episode logs are gitignored — results are local)
+output/*.csv
+output/**/*.csv
+output/episode_logs.jsonl
+
 # Ignore the contents of data/config, but not the folder itself
 data/config/*
 # Now allow the specific files

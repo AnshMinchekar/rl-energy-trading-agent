@@ -7,7 +7,12 @@ Created on Wed Oct  4 13:44:41 2023
 import gc
 import sys
 import time
+import numpy as np
+import random
 sys.stdout.reconfigure(line_buffering=True)  # flush every newline, even when piped/redirected
+
+np.random.seed(42)
+random.seed(42)
 
 from mesa_model.model import model
 from data.csv_writer import EntryWriter

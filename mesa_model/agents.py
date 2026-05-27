@@ -403,7 +403,8 @@ class storage(mesa.Agent):
     def __init__(self, model, capacity, power, node, efficiency, discharge, method):
         super().__init__(model)
         self.capacity = capacity
-        self.discharge = 1
+        timestep_frac = self.model.timestep.seconds / 86400.0
+        self.discharge = discharge ** timestep_frac
         self.efficiency = efficiency
         self.max_power = power
         self.bus = node
@@ -435,8 +436,6 @@ class storage(mesa.Agent):
         
         # Reinforcement Learning parameters
         if self.method == "learning":
-            self.soc = 0.40  
-            
             # Neural network weights
             self.theta = {
                 "layer1": {
@@ -631,28 +630,11 @@ class storage(mesa.Agent):
         z = self.theta["layer2"]["hidden_w"] * h1 + self.theta["layer2"]["bias"]
         action = np.tanh(z)
 
-        # SOC-BASED OVERRIDES - More graduated response 
-        # EMERGENCY LOW - Must charge
+        # Hard safety overrides (emergencies only)
         if soc < 0.10:
-            action = 1.0  # Maximum charge
-        elif soc < 0.15:
-            action = max(action, 0.8)  # Very strong charge
-        elif soc < 0.20:
-            action = max(action, 0.5)  # Strong charge bias
-        elif soc < 0.30:
-            action = max(action, 0.2)  # Mild charge bias
-        
-        # HIGH SOC - Must discharge
-        elif soc > 0.90:
-            action = -1.0  # Maximum discharge
-        elif soc > 0.85:
-            action = min(action, -0.9)  # Very strong discharge
-        elif soc > self.soc_ceiling: 
-            action = min(action, -0.7)  # Strong discharge bias
-        elif soc > 0.70:
-            action = min(action, -0.3)  # Moderate discharge bias
-        elif soc > 0.60:
-            action = min(action, 0.0)   # At least don't buy more!
+            action = 1.0
+        elif soc > 0.95:
+            action = -1.0
 
         if 0.25 < soc < 0.75:
             exploration = max(self.min_exploration, self.exploration_rate)
@@ -680,41 +662,21 @@ class storage(mesa.Agent):
         max_discharge, max_charge = self.provide_a_power()
         eps = 1e-6
         price_now = self.get_current_price()
-        avg_price = self.get_average_price(24)
 
+        # Emergency charge: SOC critically low
         if self.soc < 0.10:
             if max_charge > eps:
-                bid_price = 1000.0  # Pay any price
+                bid_price = 1000.0
                 bid_fun = self.offer_function(bid_price)
                 self.bid = [max_charge, max_charge, bid_fun, "lin"]
                 self.coefficients_bid = [0, bid_price * (self.model.timestep.seconds / 3600)]
             return
-        
-        if self.soc < 0.20:
-            if max_charge > eps:
-                bid_price = price_now * 5.0 + 200
-                bid_fun = self.offer_function(bid_price)
-                self.bid = [max_charge * 0.5, max_charge, bid_fun, "lin"]
-                self.coefficients_bid = [0, bid_price * (self.model.timestep.seconds / 3600)]
-            return
 
-        if self.soc > 0.92:
-            if max_discharge > eps:
-                ask_price = max(price_now * 0.3, 1.0)  
-                ask_fun = self.offer_function(ask_price)
-                discharge_amount = min(max_discharge, (self.soc - 0.50) * self.capacity * (3600 / self.model.timestep.seconds) / self.model.sref * self.efficiency)
-                discharge_amount = max(discharge_amount, max_discharge * 0.8)
-                self.ask = [discharge_amount * 0.5, discharge_amount, ask_fun, "lin"]
-                self.coefficients_ask = [0, ask_price * (self.model.timestep.seconds / 3600)]
-            return
-        
-        if self.soc > self.soc_ceiling:  
-            if max_discharge > eps:
-                ask_price = max(price_now * 0.5, 2.0)  
-                ask_fun = self.offer_function(ask_price)
-                self.ask = [max_discharge * 0.3, max_discharge * 0.7, ask_fun, "lin"]
-                self.coefficients_ask = [0, ask_price * (self.model.timestep.seconds / 3600)]
-            return
+        # Below floor: allow charge-only (keep RL magnitude, forbid discharge)
+        if self.soc < self.soc_floor:
+            action = max(action, 0.0)
+
+        # Safe discharge ceiling
         if self.soc > self.soc_floor:
             max_safe_discharge_kwh = (self.soc - self.soc_floor) * self.capacity
             max_safe_discharge_power = max_safe_discharge_kwh * (3600 / self.model.timestep.seconds) / self.model.sref * self.efficiency
@@ -722,30 +684,33 @@ class storage(mesa.Agent):
         else:
             max_safe_discharge = 0
 
-        if action > eps:  
-            charge_factor = 1.0
-            if self.soc > 0.60:
-                charge_factor = 0.3  
-            elif self.soc > 0.50:
-                charge_factor = 0.6  
-            
-            desired_power = action * max_charge * charge_factor
+        price_percentile = self.get_price_percentile()
+
+        if action > eps:
+            desired_power = min(action * max_charge, max_charge)
             if desired_power > eps:
-                bid_price = price_now * (1.0 + 0.4 * action) + 15
+                if price_percentile < 0.15:
+                    bid_premium = 0.5
+                elif price_percentile < 0.35:
+                    bid_premium = 0.8
+                else:
+                    bid_premium = 1.2
+                lec_min = self.model.gridfee_LEC + self.model.levies_LEC
+                bid_price = max(price_now + bid_premium, lec_min + bid_premium)
                 bid_fun = self.offer_function(bid_price)
                 self.bid = [0, desired_power, bid_fun, "lin"]
                 self.coefficients_bid = [0, bid_price * (self.model.timestep.seconds / 3600)]
-        
-        elif action < -eps:  
-            sell_factor = 1.0
-            if self.soc > 0.70:
-                sell_factor = 1.5  
-            elif self.soc > 0.60:
-                sell_factor = 1.2  
-            
-            desired_power = min(-action * max_discharge * sell_factor, max_safe_discharge)
-            if desired_power > eps and self.soc > self.soc_floor + 0.05:
-                ask_price = price_now * (0.7 + 0.3 * (1 + action))  # More competitive pricing
+
+        elif action < -eps:
+            desired_power = min(-action * max_discharge, max_safe_discharge)
+            if desired_power > eps:
+                if price_percentile > 0.85:
+                    ask_discount = 0.1
+                elif price_percentile > 0.65:
+                    ask_discount = 0.25
+                else:
+                    ask_discount = 0.4
+                ask_price = max(price_now - ask_discount, 0.01)
                 ask_fun = self.offer_function(ask_price)
                 self.ask = [0, desired_power, ask_fun, "lin"]
                 self.coefficients_ask = [0, ask_price * (self.model.timestep.seconds / 3600)]

@@ -462,22 +462,24 @@ class storage(mesa.Agent):
 
             self.theta = {"W1": W1, "b1": b1, "W2": W2, "b2": b2}
 
-            # Critic value function weights (linear approximation).
-            # Warm-started with sensible priors so the critic isn't fully blind early on.
-            self.value_theta = {
-                "soc_w":      0.0,
-                "soc_sq_w":  -1.0,   # penalise SOC extremes from the start
-                "price_w":    0.3,   # higher price → better state to sell from
-                "price_diff_w": 0.0,
-                "hour_w":     0.0,
-                "bias":       0.0,
-            }
+            # Neural network critic (9 → 8 LeakyReLU → 1 linear).
+            # Separate seed and smaller init scale than the actor.
+            rng_c = np.random.RandomState(seed=43)
+            scale_c = 0.05
+            cW1 = rng_c.randn(n_hidden, n_inputs).astype(float) * scale_c
+            cb1 = np.zeros(n_hidden, dtype=float)
+            cW2 = rng_c.randn(n_hidden).astype(float) * scale_c
+            cb2 = np.array([0.0], dtype=float)
+            self.critic_theta = {"W1": cW1, "b1": cb1, "W2": cW2, "b2": cb2}
+
+            # Frozen copy of critic for stable bootstrap targets (Polyak-updated).
+            self.target_critic_theta = {k: v.copy() for k, v in self.critic_theta.items()}
+            self.target_update_tau = 0.005   # Polyak averaging coefficient
             
             self.actor_lr = 0.03       # Policy learning rate
-            self.critic_lr = 0.05      # Value function learning rate 
+            self.critic_lr = 0.05      # Value function learning rate
             self.gamma = 0.98          # Discount factor
-            self.memory = deque(maxlen=4000)
-            self.batch_size = 32
+            self.trajectory = []       # On-policy buffer; cleared after each update
             
             # Tracking
             self.last_state = None
@@ -501,6 +503,9 @@ class storage(mesa.Agent):
             # Performance tracking
             self.best_profit = -np.inf
             self.best_theta = None
+            self.best_critic_theta = None
+            self.episodes_below_best = 0
+            self.restore_patience = 10   # revert to best weights after this many consecutive below-best episodes
             self.soc_history = deque(maxlen=2000)
             
             # SOC operating range
@@ -516,6 +521,12 @@ class storage(mesa.Agent):
             # Rolling 24-hour observed price history (96 steps × 15 min = 24 h).
             # Used for average/percentile so we only use prices the agent has seen.
             self.price_history = deque(maxlen=96)
+
+            # Lag buffers for causal price forecasting (no future leakage).
+            # price_lag_buffer_1h holds the last 4 observed prices (4 × 15 min = 1 h);
+            # oldest entry is used as the "1h-ago" proxy for the +1h forecast.
+            self._price_lag_buffer_1h = deque(maxlen=4)
+            self._price_lag_buffer_4h = deque(maxlen=16)
 
             # TD learning tracking
             self.td_errors = []  # Track TD errors for debugging
@@ -571,20 +582,16 @@ class storage(mesa.Agent):
         return 30.0
 
     def get_price_forecast(self, hours_ahead):
-        """Get forecasted price N hours ahead."""
-        if not self._price_cache_ready:
-            self._initialize_price_cache()
-        
-        try:
-            steps_ahead = int(hours_ahead * 3600 / self.model.timestep.seconds)
-            forecast_time = self.model.current_date + self.model.timestep * steps_ahead
-            
-            if self._price_cache_ready and self._price_index:
-                price = self._price_index.get(forecast_time)
-                if price is not None:
-                    return float(price)
-        except (AttributeError, IndexError, KeyError, TypeError):
-            pass
+        """Causal lag-based forecast: returns the price observed ~hours_ahead ago.
+
+        Uses 1-h and 4-h lag buffers populated in update_status, so only prices
+        the agent has already seen are used — no future leakage.
+        Falls back to current price while the buffer hasn't filled yet.
+        """
+        if hours_ahead == 1 and len(self._price_lag_buffer_1h) == self._price_lag_buffer_1h.maxlen:
+            return float(self._price_lag_buffer_1h[0])   # oldest entry = 1 h ago
+        if hours_ahead == 4 and len(self._price_lag_buffer_4h) == self._price_lag_buffer_4h.maxlen:
+            return float(self._price_lag_buffer_4h[0])   # oldest entry = 4 h ago
         return self.get_current_price()
 
     def get_average_price(self, hours_back=24):
@@ -638,88 +645,56 @@ class storage(mesa.Agent):
                 sin_hour, cos_hour, sin_dow, cos_dow, price_percentile]
 
     
-    def estimate_value(self, state):
-        # State layout: [soc, price_norm, price_diff_1h, price_diff_4h,
-        #                sin_hour, cos_hour, sin_dow, cos_dow, price_percentile]
-        soc        = state[0]
-        price_norm = state[1]
-        price_diff = state[2]
-        sin_hour   = state[4]   # hour_w now tracks sin(hour) — continuous proxy for time-of-day
+    def estimate_value(self, state, use_target=False):
+        """Neural network critic forward pass (9 → 8 LeakyReLU → 1 linear).
 
-        value = (
-            self.value_theta["soc_w"]      * (soc - self.soc_target) +
-            self.value_theta["soc_sq_w"]   * ((soc - self.soc_target) ** 2) +
-            self.value_theta["price_w"]    * price_norm +
-            self.value_theta["price_diff_w"] * price_diff +
-            self.value_theta["hour_w"]     * sin_hour +
-            self.value_theta["bias"]
-        )
-
-        return value
-
-    def policy(self, state):
-        """Two-layer neural network policy (4 hidden neurons).
+        Parameters
+        ----------
+        state      : state vector (list or array, length 9)
+        use_target : if True, use the frozen target network for bootstrapping V_next
 
         Returns
         -------
-        action      : float in [-1, 1]  — final action sent to the market
-        raw_action  : float             — tanh(z) before any bias/noise/clip (used for gradients)
+        value  : scalar state value estimate
+        h1     : post-activation hidden layer (ndarray, shape n_hidden)
+        h1_in  : pre-activation hidden layer — needed for backprop
+        """
+        weights = self.target_critic_theta if use_target else self.critic_theta
+        x = np.array(state, dtype=float)
+        h1_in = weights["W1"] @ x + weights["b1"]
+        h1 = np.where(h1_in > 0, h1_in, 0.1 * h1_in)   # LeakyReLU
+        h1 = np.clip(h1, -5.0, 5.0)
+        value = float(np.dot(weights["W2"], h1) + weights["b2"][0])
+        return value, h1, h1_in
+
+    def policy(self, state):
+        """Two-layer neural network policy.
+
+        Returns
+        -------
+        action      : float in [-1, 1]  — network output (hard safety overrides applied)
+        raw_action  : float             — tanh(z) before any override (used for gradients)
         h1          : ndarray (n_hidden,) — post-activation hidden values
         h1_in       : ndarray (n_hidden,) — pre-activation hidden values (for LeakyReLU derivative)
+
+        Exploration noise and soft biases are NOT applied here so that raw_action
+        is a clean, differentiable function of the network weights. Noise is added
+        in step() after this returns, so gradients are uncontaminated.
         """
         x = np.array(state, dtype=float)   # shape (9,)
-        soc, _, _, _, _, _, _, _, price_percentile = state
+        soc = state[0]
 
         # --- Layer 1: hidden (LeakyReLU) ---
-        h1_in = self.theta["W1"] @ x + self.theta["b1"]          # (n_hidden,)
-        h1 = np.where(h1_in > 0, h1_in, 0.1 * h1_in)            # LeakyReLU
+        h1_in = self.theta["W1"] @ x + self.theta["b1"]
+        h1 = np.where(h1_in > 0, h1_in, 0.1 * h1_in)
         h1 = np.clip(h1, -5.0, 5.0)
 
         # --- Layer 2: output (Tanh) ---
         z = float(np.dot(self.theta["W2"], h1) + self.theta["b2"][0])
-        raw_action = float(np.tanh(z))                            # kept clean for gradient use
+        raw_action = float(np.tanh(z))
         action = raw_action
 
-        # --- Soft biases (10% influence — reduced from 40% to limit credit-assignment noise) ---
-        # Soft SOC biases — only activate at true extremes so the learned policy dominates
-        # in the normal trading range (10–85%). Biases match the updated soc_ceiling of 0.85.
-        soc_bias = 0.0
-        if soc < 0.12:
-            soc_bias = 0.8        # Very low SOC: push to charge hard
-        elif soc < self.soc_floor:
-            soc_bias = 0.4
-        elif soc > 0.93:
-            soc_bias = -0.8       # Very high SOC: push to discharge hard
-        elif soc > self.soc_ceiling:
-            soc_bias = -0.5 * (soc - self.soc_ceiling) / 0.10
-
-        price_bias = 0.0
-        if price_percentile < 0.15:
-            price_bias = 0.4
-        elif price_percentile < 0.25:
-            price_bias = 0.2
-        elif price_percentile > 0.85:
-            price_bias = -0.4
-        elif price_percentile > 0.75:
-            price_bias = -0.2
-
-        # Dynamic bias blend — stronger safety override at low SOC
-        if soc < 0.15:
-            bias_weight = 0.50
-        elif soc < 0.20:
-            bias_weight = 0.30
-        else:
-            bias_weight = 0.10
-        action = (1 - bias_weight) * action + bias_weight * (soc_bias + price_bias)
-
-        # --- Exploration noise (active at all SOC levels except hard ceiling) ---
-        if soc < 0.95:
-            noise = np.random.normal(0, max(self.min_exploration, self.exploration_rate) * 0.4)
-            action += noise
-
-        action = float(np.clip(action, -1.0, 1.0))
-
-        # --- Hard override: true emergencies only ---
+        # --- Hard safety overrides (emergencies only; not learnable) ---
         if soc < 0.10:
             action = 1.0
         elif soc > 0.95:
@@ -887,9 +862,6 @@ class storage(mesa.Agent):
         
         bought = result["Energy bought [kWh]"].to_numpy()[0]
         sold = result["Energy sold [kWh]"].to_numpy()[0]
-        # DEBUG — remove once trading is confirmed
-        if self.method == "learning" and self.model.stepcount <= 4:
-            print(f"[DBG update step={int(self.model.stepcount)}] bought={bought:.4f} kWh sold={sold:.4f} kWh", flush=True)
 
         old_soc = self.soc
         energy_delta = bought * self.efficiency - sold / self.efficiency
@@ -905,6 +877,8 @@ class storage(mesa.Agent):
             # Add observed price to rolling window (used by get_average_price / get_price_percentile)
             price = self.get_current_price()
             self.price_history.append(price)
+            self._price_lag_buffer_1h.append(price)
+            self._price_lag_buffer_4h.append(price)
 
             if self.last_state is not None and self.last_action is not None:
 
@@ -923,7 +897,7 @@ class storage(mesa.Agent):
 
                 next_state = self.build_state()
 
-                self.memory.append((
+                self.trajectory.append((
                     self.last_state,
                     self.last_action,
                     self.last_raw_action,   # raw tanh(z) — used for correct gradient computation
@@ -961,7 +935,7 @@ class storage(mesa.Agent):
         print(f"  Energy Sold (kWh):   {self.cumulative_sold:>12.2f}")
         print(f"  Net Energy (kWh):    {self.cumulative_bought - self.cumulative_sold:>12.2f}")
         print(f"  Exploration Rate:    {self.exploration_rate:>12.4f}")
-        print(f"  Memory Size:         {len(self.memory):>12d}")
+        print(f"  Trajectory Size:     {len(self.trajectory):>12d}")
         print(f"  Current SOC:         {self.soc*100:>12.1f}%")
         print(f"  SOC Range (24h):     {min_soc*100:>6.1f}% - {max_soc*100:.1f}%")
         print(f"  Avg SOC (24h):       {avg_soc*100:>12.1f}%")
@@ -970,13 +944,19 @@ class storage(mesa.Agent):
 
         if self.cumulative_profit > self.best_profit:
             self.best_profit = self.cumulative_profit
-            self.best_theta = {
-                "W1": self.theta["W1"].copy(),
-                "b1": self.theta["b1"].copy(),
-                "W2": self.theta["W2"].copy(),
-                "b2": self.theta["b2"].copy(),
-            }
+            self.episodes_below_best = 0
+            self.best_theta = {k: v.copy() for k, v in self.theta.items()}
+            self.best_critic_theta = {k: v.copy() for k, v in self.critic_theta.items()}
             print(f"  *** New best profit: €{self.best_profit:.4f} ***", flush=True)
+        else:
+            self.episodes_below_best += 1
+            if (self.best_theta is not None
+                    and self.episodes_below_best >= self.restore_patience):
+                self.theta = {k: v.copy() for k, v in self.best_theta.items()}
+                self.critic_theta = {k: v.copy() for k, v in self.best_critic_theta.items()}
+                self.target_critic_theta = {k: v.copy() for k, v in self.best_critic_theta.items()}
+                self.episodes_below_best = 0
+                print(f"  [Restore] Reverted to best weights (profit €{self.best_profit:.4f})", flush=True)
 
     def _log_episode(self):
         """Log episode to JSON file."""
@@ -1010,7 +990,12 @@ class storage(mesa.Agent):
                 "W2": [round(float(v), 6) for v in self.theta["W2"]],
                 "b2": [round(float(v), 6) for v in self.theta["b2"]],
             },
-            "value_theta": {k: round(float(v), 6) for k, v in self.value_theta.items()},
+            "critic_theta": {
+                "W1": [[round(float(v), 6) for v in row] for row in self.critic_theta["W1"]],
+                "b1": [round(float(v), 6) for v in self.critic_theta["b1"]],
+                "W2": [round(float(v), 6) for v in self.critic_theta["W2"]],
+                "b2": [round(float(v), 6) for v in self.critic_theta["b2"]],
+            },
         }
 
         try:
@@ -1037,95 +1022,81 @@ class storage(mesa.Agent):
         self.exploration_rate *= self.exploration_decay
         self.exploration_rate = max(self.exploration_rate, self.min_exploration)
     
-    def _sample_batch(self):
-        """Sample a random mini-batch from memory."""
-        indices = np.random.choice(len(self.memory), self.batch_size, replace=False)
-        return [self.memory[i] for i in indices]
-
     def _critic_gradient_step(self, batch):
-        """Compute and apply one critic gradient update. Returns list of TD errors."""
-        grad_value = {k: 0.0 for k in self.value_theta}
+        """Backprop through the neural network critic. Returns list of TD errors.
+
+        V_next is computed from the frozen target network to stabilise training.
+        """
+        grad = {k: np.zeros_like(v) for k, v in self.critic_theta.items()}
         td_errors = []
+        n = len(batch)
 
         for transition in batch:
-            state, action, raw_action, reward, next_state, h1, h1_in, soc = transition
+            state, action, raw_action, reward, next_state, _, _, soc = transition
 
-            # State layout: [soc, price_norm, price_diff_1h, price_diff_4h,
-            #                sin_hour, cos_hour, sin_dow, cos_dow, price_percentile]
-            soc_state  = state[0]
-            price_norm = state[1]
-            price_diff = state[2]
-            sin_hour   = state[4]
-
-            V_current = self.estimate_value(state)
-            V_next    = self.estimate_value(next_state)
-            td_error  = reward + self.gamma * V_next - V_current
+            V_current, c_h1, c_h1_in = self.estimate_value(state, use_target=False)
+            V_next,    _,    _        = self.estimate_value(next_state, use_target=True)
+            td_error = reward + self.gamma * V_next - V_current
             td_errors.append(td_error)
 
-            grad_value["soc_w"]        += td_error * (soc_state - self.soc_target)
-            grad_value["soc_sq_w"]     += td_error * ((soc_state - self.soc_target) ** 2)
-            grad_value["price_w"]      += td_error * price_norm
-            grad_value["price_diff_w"] += td_error * price_diff
-            grad_value["hour_w"]       += td_error * sin_hour
-            grad_value["bias"]         += td_error
+            # Backprop: dL/dV_current = td_error (semi-gradient — V_next treated as fixed target)
+            dout = td_error
+            grad["W2"] += dout * c_h1
+            grad["b2"] += dout
+            leaky_d = np.where(c_h1_in > 0, 1.0, 0.1)
+            delta_h = dout * self.critic_theta["W2"] * leaky_d
+            x = np.array(state, dtype=float)
+            grad["W1"] += np.outer(delta_h, x)
+            grad["b1"] += delta_h
 
         max_grad = 0.5
-        for key in self.value_theta:
-            grad = np.clip(grad_value[key] / self.batch_size, -max_grad, max_grad)
-            self.value_theta[key] += self.critic_lr * grad
+        for key in self.critic_theta:
+            g = np.clip(grad[key] / n, -max_grad, max_grad)
+            self.critic_theta[key] += self.critic_lr * g
 
         return td_errors
 
     def update_parameters(self):
-        if len(self.memory) < self.batch_size:
+        if len(self.trajectory) < 1:
             return
 
+        batch = list(self.trajectory)
+        n = len(batch)
         max_grad = 0.5
 
-        # ── Critic: 5 independent updates before the actor step ───────────
-        # Running more critic updates ensures the value function is a good
-        # baseline before the actor gradient uses it as an advantage signal.
+        # ── Critic: 3 passes over the on-policy trajectory ────────────────
         all_td_errors = []
-        for _ in range(5):
-            td_errors = self._critic_gradient_step(self._sample_batch())
+        for _ in range(3):
+            td_errors = self._critic_gradient_step(batch)
             all_td_errors.extend(td_errors)
 
-        #Actor: 1 update using the now-improved critic 
-        batch = self._sample_batch()
-
+        # ── Actor: 1 update using the now-improved critic ─────────────────
         grad_W1 = np.zeros_like(self.theta["W1"])
         grad_b1 = np.zeros_like(self.theta["b1"])
         grad_W2 = np.zeros_like(self.theta["W2"])
         grad_b2 = np.zeros_like(self.theta["b2"])
 
-        actor_td_errors = []
         raw_advantages = []
-        actor_transitions = []
         for transition in batch:
             state, action, raw_action, reward, next_state, h1, h1_in, soc = transition
-            V_current = self.estimate_value(state)
-            V_next    = self.estimate_value(next_state)
-            td_error  = reward + self.gamma * V_next - V_current
-            actor_td_errors.append(td_error)
+            V_current, _, _ = self.estimate_value(state, use_target=False)
+            V_next,    _, _ = self.estimate_value(next_state, use_target=True)
+            td_error = reward + self.gamma * V_next - V_current
             raw_advantages.append(td_error)
-            actor_transitions.append(transition)
 
-        # Normalize advantages across the batch so large TD spikes don't dominate the gradient.
+        # Normalize advantages so large TD spikes don't dominate the gradient.
         adv_arr = np.array(raw_advantages)
         adv_mean = float(np.mean(adv_arr))
         adv_std  = float(np.std(adv_arr)) + 1e-8
         normalized_advantages = (adv_arr - adv_mean) / adv_std
 
-        for i, transition in enumerate(actor_transitions):
+        for i, transition in enumerate(batch):
             state, action, raw_action, reward, next_state, h1, h1_in, soc = transition
             advantage = float(normalized_advantages[i])
 
-            # Tanh derivative evaluated at raw network output (before bias/noise)
-            dz = advantage * (1.0 - raw_action ** 2)
-
+            dz = advantage * (1.0 - raw_action ** 2)   # tanh derivative at raw network output
             grad_W2 += dz * h1
             grad_b2 += dz
-
             leaky_deriv = np.where(h1_in > 0, 1.0, 0.1)
             delta_h = dz * self.theta["W2"] * leaky_deriv
             x = np.array(state, dtype=float)
@@ -1140,14 +1111,24 @@ class storage(mesa.Agent):
             actor_lr *= 1.1 if recent > older else 0.9
             actor_lr = float(np.clip(actor_lr, 0.01, 0.08))
 
-        self.theta["W1"] += actor_lr * np.clip(grad_W1 / self.batch_size, -max_grad, max_grad)
-        self.theta["b1"] += actor_lr * np.clip(grad_b1 / self.batch_size, -max_grad, max_grad)
-        self.theta["W2"] += actor_lr * np.clip(grad_W2 / self.batch_size, -max_grad, max_grad)
-        self.theta["b2"] += actor_lr * np.clip(grad_b2 / self.batch_size, -max_grad, max_grad)
+        self.theta["W1"] += actor_lr * np.clip(grad_W1 / n, -max_grad, max_grad)
+        self.theta["b1"] += actor_lr * np.clip(grad_b1 / n, -max_grad, max_grad)
+        self.theta["W2"] += actor_lr * np.clip(grad_W2 / n, -max_grad, max_grad)
+        self.theta["b2"] += actor_lr * np.clip(grad_b2 / n, -max_grad, max_grad)
 
         # ── Weight decay: prevent W1/W2 from growing into tanh saturation ─
         self.theta["W1"] *= 0.999
         self.theta["W2"] *= 0.999
+
+        # ── Polyak soft-update of target critic network ───────────────────
+        tau = self.target_update_tau
+        for key in self.critic_theta:
+            self.target_critic_theta[key] = (
+                (1 - tau) * self.target_critic_theta[key] + tau * self.critic_theta[key]
+            )
+
+        # ── Clear on-policy buffer ────────────────────────────────────────
+        self.trajectory = []
 
         # ── Store TD errors for monitoring ────────────────────────────────
         self.td_errors.extend(all_td_errors)
@@ -1156,10 +1137,11 @@ class storage(mesa.Agent):
 
         avg_td = float(np.mean(all_td_errors))
         std_td = float(np.std(all_td_errors))
+        critic_w2_norm = float(np.mean(np.abs(self.critic_theta["W2"])))
         print(f"[Storage {self.unique_id}] Updated (actor_lr={actor_lr:.4f}, critic_lr={self.critic_lr:.4f})")
         print(f"  TD Error: mean={avg_td:.3f}, std={std_td:.3f}")
-        print(f"  W2 (output weights): {np.round(self.theta['W2'], 3)}")
-        print(f"  Critic: soc={self.value_theta['soc_w']:.3f}, price={self.value_theta['price_w']:.3f}, bias={self.value_theta['bias']:.3f}", flush=True)
+        print(f"  Actor W2 (output weights): {np.round(self.theta['W2'], 3)}")
+        print(f"  Critic W2 mean abs: {critic_w2_norm:.4f}", flush=True)
 
     
     def offer_function(self, price):
@@ -1214,6 +1196,11 @@ class storage(mesa.Agent):
                 state = self.build_state()
                 action, raw_action, hidden, h1_in = self.policy(state)
 
+                # Exploration noise applied to action only — raw_action stays clean for gradients
+                if self.soc < 0.95:
+                    noise = np.random.normal(0, max(self.min_exploration, self.exploration_rate) * 0.4)
+                    action = float(np.clip(action + noise, -1.0, 1.0))
+
                 self.last_state      = state
                 self.last_action     = action
                 self.last_raw_action = raw_action
@@ -1221,12 +1208,6 @@ class storage(mesa.Agent):
                 self.last_h1_in      = h1_in
 
                 self.action_to_bid(action)
-                # DEBUG — remove once trading is confirmed
-                if self.model.stepcount <= 3:
-                    price_now = self.get_current_price()
-                    print(f"[DBG step={int(self.model.stepcount)}] action={action:.3f} soc={self.soc:.3f} "
-                          f"price={price_now:.2f} bid_pmax={self.bid[1]:.4f} ask_pmax={self.ask[1]:.4f} "
-                          f"bid_coef={self.coefficients_bid} ask_coef={self.coefficients_ask}", flush=True)
 
 #-------------------------------------------------------------------------------------------
 class EV(mesa.Agent):

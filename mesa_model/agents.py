@@ -470,7 +470,7 @@ class storage(mesa.Agent):
             self.cumulative_profit = 0
             self.cumulative_bought = 0
             self.cumulative_sold = 0
-            self.update_frequency = 96 
+            self.update_frequency = 48
             self.episode_counter = 0
             
             # Exploration parameters

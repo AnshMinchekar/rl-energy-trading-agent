@@ -185,16 +185,16 @@ if action < 0:  # Negative = Sell
 
 ### Safety Overrides
 
-The policy includes hard limits to prevent the sotrage from completely depeleting:
+The policy includes hard limits to prevent the storage from completely depleting:
 
 ```python
 # Emergency conditions (override neural network)
 if soc < 0.10:  action = +1.0   # Must charge!
-if soc > 0.90:  action = -1.0   # Must discharge!
+if soc > 0.95:  action = -1.0   # Must discharge!
 
-# Soft boundaries
-if soc < 0.20:  action = max(action, +0.6)  # Encourage charging
-if soc > 0.80:  action = min(action, -0.6)  # Encourage discharging
+# Price-based nudges (applied after NN output)
+if price_percentile < 0.15 and soc < 0.60:  action += 0.25  # Cheap price → nudge to buy
+if price_percentile > 0.85 and soc > 0.35:  action -= 0.25  # Expensive price → nudge to sell
 ```
 
 ---
@@ -249,30 +249,77 @@ reward = profit_reward + soc_penalty + arbitrage_bonus + soc_center_bonus
 
 ## 6. Learning Algorithm
 
-### Policy Gradient Method
+### Monte Carlo Policy Gradient (REINFORCE)
 
-We use a variant of a type of RL that utilizes gradient ascent to maximize cumulative reward by adjustic its weights.
+The agent uses **Monte Carlo Policy Gradient** — it collects a full episode of experience (96 timesteps = 1 day) before updating its weights, using the actual realized returns from that trajectory.
 
-### Experience Memory
+### Episode Cycle
 
-Each timestep, we store a transition:
+Each timestep during an episode:
 
 ```python
-memory.append((state, action, reward, next_state, hidden, soc))
+# 1. Act
+state = build_state()
+action, hidden = policy(state)          # forward pass through NN
+place_market_bid_or_ask(action)
+
+# 2. Observe outcome (after market clears)
+reward = compute_reward(bought, sold, price)
+episode_buffer.append((state, action, reward, hidden))
 ```
 
-The memory holds up to 15,000 transitions (~156 days of data).
+After 96 steps, the MC update runs and the buffer is cleared.
+
+### Return Computation
+
+True discounted returns are computed **backwards** through the episode buffer:
+
+```
+G = 0
+for each step (reversed):
+    G = reward + γ × G      (γ = 0.98)
+    returns.prepend(G)
+```
+
+This gives each step its true long-run return — unlike TD methods which bootstrap from a value estimate. Returns are then **normalized** (zero mean, unit std) to reduce gradient variance.
+
+### Weight Update (Policy Gradient Backprop)
+
+Gradients are computed manually through the 2-layer network:
+
+```python
+# Output layer gradient
+grad_output = advantage × (1 - action²)   # derivative of tanh
+
+# Hidden layer gradient (backprop through LeakyReLU)
+grad_hidden = grad_output × hidden_w × leaky_relu_deriv
+
+# Accumulate over all steps in the episode, then apply:
+weight += lr × clip(grad / n, -0.3, +0.3)
+```
+
+Where `advantage = G_t` (the normalized return for that step).
 
 ### Adaptive Learning Rate
 
 ```python
 if recent_profits > older_profits:
-    lr *= 1.05  # Learning is working, speed up
+    lr *= 1.05  # Working → speed up
 else:
-    lr *= 0.95  # Learning is struggling, slow down
+    lr *= 0.95  # Struggling → slow down
 
 lr = clip(lr, 0.001, 0.015)
 ```
+
+### Experience Memory
+
+Each timestep also stores a transition to a replay buffer (capacity 15,000):
+
+```python
+memory.append((state, action, reward, next_state, hidden, soc))
+```
+
+The MC weight update uses the `episode_buffer`, not this replay memory.
 
 ---
 
@@ -285,7 +332,7 @@ Applied directly to the weights.
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | `learning_rate` | 0.008 | Step size for weight updates |
-| `gamma` | 0.98 | Discount factor (not actively used) |
+| `gamma` | 0.98 | Discount factor for computing G_t = r + γ·G |
 | `batch_size` | 64 | Samples per update |
 | `memory_size` | 15,000 | Maximum stored transitions |
 | `update_frequency` | 96 | Timesteps between updates (1 day) |

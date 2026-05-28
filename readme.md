@@ -109,12 +109,18 @@ Here, if h1_input > 0
   h1 = 0.1 × h1_input 
 ```
 
+- `target` = SOC target centre point (0.50) — the agent is nudged to keep the battery half-full
+- `bias₁` = learned bias term for the hidden layer
+
 **Layer 2 (Output):**
 ```
 z = hidden_w × h1 + bias₂
 
 action = tanh(z) ∈ [-1, +1]
 ```
+
+- `z` = pre-activation value (weighted sum before tanh is applied)
+- `bias₂` = learned bias term for the output layer
 
 ### Why These Activations?
 
@@ -276,10 +282,20 @@ True discounted returns are computed **backwards** through the episode buffer:
 
 ```
 G = 0
-for each step (reversed):
-    G = reward + γ × G      (γ = 0.98)
+for each step t (reversed):
+    G = rₜ + γ × G
     returns.prepend(G)
 ```
+
+**Symbol definitions:**
+
+| Symbol | Meaning |
+|--------|---------|
+| `G` | Discounted cumulative return — the total reward from step t to end of episode |
+| `rₜ` | Reward received at timestep t |
+| `γ` (gamma) | Discount factor (0.98) — how much future rewards are worth relative to immediate ones. γ=0.98 means a reward 1 step away is worth 98% of an immediate reward |
+| `t` | Current timestep index within the episode (0 to 95) |
+| `reversed` | We iterate from the last step backwards so each G accumulates future rewards correctly |
 
 This gives each step its true long-run return — unlike TD methods which bootstrap from a value estimate. Returns are then **normalized** (zero mean, unit std) to reduce gradient variance.
 
@@ -298,7 +314,17 @@ grad_hidden = grad_output × hidden_w × leaky_relu_deriv
 weight += lr × clip(grad / n, -0.3, +0.3)
 ```
 
-Where `advantage = G_t` (the normalized return for that step).
+**Symbol definitions:**
+
+| Symbol | Meaning |
+|--------|---------|
+| `advantage` | The normalized return `G_t` for that step — how much better/worse this outcome was than average |
+| `G_t` | Normalized discounted return at step t |
+| `n` | Total number of steps in the episode (96) — used to average gradients |
+| `lr` | Learning rate (~0.008, adaptive) |
+| `action²` | Squared action value — appears in the tanh derivative: d/dx tanh(x) = 1 - tanh²(x) |
+| `leaky_relu_deriv` | 1.0 if hidden unit h1 > 0, else 0.1 |
+| `clip(·, -0.3, +0.3)` | Gradient clipping — prevents any single update from being too large |
 
 ### Adaptive Learning Rate
 

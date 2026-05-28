@@ -13,13 +13,17 @@ Buy Low  →  Store  →  Sell High  →  Profit
 ### Data Flow
 
 ```
-Market Data → State Builder → Neural Network → Action → Market Bid/Ask
-                                   ↓
-                            Experience Memory
-                                   ↓
-                            Policy Gradient Update
-                                   ↓
-                            Updated Weights
+Market Data → State Builder → Actor (Neural Network) → Action → Market Bid/Ask
+                                      ↓
+                               Trajectory Buffer
+                                      ↓
+                    ┌─────────────────────────────────┐
+                    │  TD Actor-Critic Update         │
+                    │  Critic: learn V(s)             │
+                    │  Actor:  improve π using δ      │
+                    └─────────────────────────────────┘
+                                      ↓
+                              Updated Weights
 ```
 
 ---
@@ -29,8 +33,8 @@ Market Data → State Builder → Neural Network → Action → Market Bid/Ask
 The agent creates a **9-dimensional state vector**:
 
 ```python
-state = [soc, max_discharge, max_charge, price_norm, 
-         price_diff_1h, price_diff_4h, hour_norm, dow_norm, price_percentile]
+state = [soc, price_norm, price_diff_1h, price_diff_4h,
+         sin_hour, cos_hour, sin_dow, cos_dow, price_percentile]
 ```
 
 ### State Features Explained
@@ -38,116 +42,120 @@ state = [soc, max_discharge, max_charge, price_norm,
 | Index | Feature | Range | Description |
 |-------|---------|-------|-------------|
 | 0 | `soc` | [0, 1] | Current battery charge level |
-| 1 | `max_discharge` | [0, P_max] | Maximum power available to sell |
-| 2 | `max_charge` | [0, P_max] | Maximum power available to buy |
-| 3 | `price_norm` | ~[-1, 1] | Current price relative to 24h average |
-| 4 | `price_diff_1h` | ~[-1, 1] | Expected price change in 1 hour |
-| 5 | `price_diff_4h` | ~[-1, 1] | Expected price change in 4 hours |
-| 6 | `hour_norm` | [0, 1] | Hour of day |
-| 7 | `dow_norm` | [0, 1] | Day of week |
-| 8 | `price_percentile` | [0, 1] | Price percentile in last 24 hours |
+| 1 | `price_norm` | ~[-1, 1] | Current price relative to 24h rolling average |
+| 2 | `price_diff_1h` | ~[-1, 1] | Price 1 hour ago relative to current price (lag-based, no future leakage) |
+| 3 | `price_diff_4h` | ~[-1, 1] | Price 4 hours ago relative to current price (lag-based, no future leakage) |
+| 4 | `sin_hour` | [-1, 1] | Sine of hour-of-day (circular encoding) |
+| 5 | `cos_hour` | [-1, 1] | Cosine of hour-of-day (circular encoding) |
+| 6 | `sin_dow` | [-1, 1] | Sine of day-of-week (circular encoding) |
+| 7 | `cos_dow` | [-1, 1] | Cosine of day-of-week (circular encoding) |
+| 8 | `price_percentile` | [0, 1] | Where the current price sits within the last 24h observed prices |
+
+**Why sin/cos for time?**
+Raw hour values (0–23) create a discontinuity at midnight: hour 23 and hour 0 appear far apart numerically but are only 15 minutes apart. Encoding as sin/cos pairs makes the time space continuous and circular — midnight wraps smoothly.
+
+**Why lag-based price diffs?**
+`price_diff_1h` uses the price observed 1 hour ago (stored in a rolling buffer), not a future forecast. This prevents data leakage — the agent only uses prices it has already seen.
 
 ### Example State Interpretation
 
 ```python
-state = [0.45, 0.37, 0.37, -0.25, +0.15, +0.40, 0.25, 0.33, 0.12]
+state = [0.45, -0.25, +0.15, +0.40, -1.0, 0.0, 0.5, 0.87, 0.12]
 ```
 
 **Breakdown:**
-- Battery is 45% full 
-- Can charge or discharge at 37 kW
-- Current price is 25% below average 
-- Price rising 15% in 1 hour, 40% in 4 hours
-- It's 6 AM on Wednesday
-- Price is in bottom 12% of last 24 hours
+- Battery is 45% full
+- Current price is 25% below the 24h average
+- Price was 15% higher 1 hour ago (price falling)
+- Price was 40% higher 4 hours ago (price has been falling for a while)
+- It's around 6 AM on a weekday
+- Price is in the bottom 12% of the last 24 hours
 
-**Optimal decision:** To buy. (Since the prices are low but rising)
+**Optimal decision:** To buy. (Price is cheap and historically low)
 
 ---
 
-## 3. Neural Network Policy
+## 3. Neural Network Policy (Actor)
 
 ### Architecture
 
-The policy is a simple **2-layer neural network**:
+The actor is a **2-layer neural network** with an 8-neuron hidden layer:
 
 ```
 Input (9 features)
        │
        ▼
-┌─────────────────────┐
-│  Hidden Layer       │
-│  - Weighted sum     │
-│  - LeakyReLU        │
-│  - 1 neuron         │
-└─────────────────────┘
+┌──────────────────────────┐
+│  Hidden Layer            │
+│  W1: [8×9] weight matrix │
+│  b1: [8] bias vector     │
+│  Activation: LeakyReLU   │
+│  8 neurons               │
+└──────────────────────────┘
        │
        ▼
-┌─────────────────────┐
-│  Output Layer       │
-│  - Weighted sum     │
-│  - Tanh activation  │
-│  - 1 neuron         │
-└─────────────────────┘
+┌──────────────────────────┐
+│  Output Layer            │
+│  W2: [8] weight vector   │
+│  b2: [1] bias scalar     │
+│  Activation: Tanh        │
+│  1 neuron                │
+└──────────────────────────┘
        │
        ▼
 Action ∈ [-1, +1]
 ```
 
-
-
 **Layer 1 (Hidden):**
 ```
-h1_input = soc_w × (soc - target) + price_w × price_norm + ... + bias₁
+h1_in = W1 · x + b1        ← matrix multiply: shape [8]
 
-h1 = LeakyReLU(h1_input)
+h1 = LeakyReLU(h1_in)
 
-Here, if h1_input > 0
-  h1 = h1_input 
-
-  or else, 
-  h1 = 0.1 × h1_input 
+  if h1_in > 0:  h1 = h1_in
+  else:          h1 = 0.1 × h1_in
 ```
 
 **Layer 2 (Output):**
 ```
-z = hidden_w × h1 + bias₂
+z = W2 · h1 + b2            ← dot product: scalar
 
-action = tanh(z) ∈ [-1, +1]
+raw_action = tanh(z) ∈ [-1, +1]
 ```
+
+**Symbol definitions:**
+
+| Symbol | Meaning |
+|--------|---------|
+| `x` | Input state vector (length 9) |
+| `W1` | Weight matrix, shape [8 × 9] — connects inputs to hidden neurons |
+| `b1` | Bias vector, shape [8] — one bias per hidden neuron |
+| `h1_in` | Pre-activation hidden values (before LeakyReLU) |
+| `h1` | Post-activation hidden values (after LeakyReLU), shape [8] |
+| `W2` | Output weight vector, shape [8] — connects hidden to output |
+| `b2` | Output bias, scalar |
+| `z` | Pre-activation output value (before tanh) |
+| `raw_action` | Network output tanh(z) before safety overrides — stored separately for clean gradient computation |
+| `·` | Dot product / matrix-vector multiply |
 
 ### Why These Activations?
 
 | Activation | Location | Purpose |
 |------------|----------|---------|
-| **LeakyReLU** | Hidden layer | Prevents "dead neurons" during exploration, basically keeping the weights updated |
-| **Tanh** | Output layer | Bounds action to [-1, +1] range |
+| **LeakyReLU** | Hidden layer | Prevents dead neurons — gradient still flows when h1_in < 0 (slope = 0.1 instead of 0) |
+| **Tanh** | Output layer | Bounds action to [-1, +1] — maps naturally to charge/discharge |
 
-### Network Weights
+### Safety Overrides
+
+After the network computes `raw_action`, hard limits are applied for emergencies:
 
 ```python
-theta = {
-    "layer1": {
-        "soc_w": -3.0,        # High SOC → sell (negative action)
-        "price_w": -1.2,      # High price → sell
-        "price_diff_w": 0.8,  
-        "forecast_1h_w": 0.5,
-        "forecast_4h_w": 0.5,
-        "time_w": 0.2,
-        "dow_w": 0.0,
-        "bias": 0.0
-    },
-    "layer2": {
-        "hidden_w": 1.5,
-        "bias": 0.0
-    }
-}
+# Emergency conditions (override neural network)
+if soc < 0.10:  action = +1.0   # Must charge immediately
+if soc > 0.95:  action = -1.0   # Must discharge immediately
 ```
 
-**Intuition behind `soc_w = -3.0`:**
-- When SOC is above target: `(soc - target) > 0`
-- Multiplied by negative weight: `-3.0 × positive = negative`
-- Negative hidden value → negative action → **SELL**
+`raw_action` is kept unchanged so gradients are computed on the clean network output, not the overridden value.
 
 ---
 
@@ -155,124 +163,258 @@ theta = {
 
 ### Continuous Action
 
-The neural network outputs a single continuous value:
+The actor outputs a single continuous value:
 
 ```
 action ∈ [-1, +1]
 ```
 
-| Action Value | Meaning | Market Behavior |
+| Action Value | Meaning | Market Behaviour |
 |--------------|---------|-----------------|
-| +1.0 | Maximum charge | Buy at high price |
-| +0.5 | Moderate charge | Buy at reasonable price |
+| +1.0 | Maximum charge | Buy as much as physically possible |
+| +0.5 | Moderate charge | Buy at half capacity |
 | 0.0 | Hold | No trading |
-| -0.5 | Moderate discharge | Sell at reasonable price |
-| -1.0 | Maximum discharge | Sell at low price |
+| -0.5 | Moderate discharge | Sell at half capacity |
+| -1.0 | Maximum discharge | Sell as much as safely allowed |
 
 ### Action to Market Bid/Ask
 
-The continuous action is converted to market orders:
-
 ```python
-if action > 0:  # Positive = Buy
+if action > 0:  # Charge — place a buy bid
     power = action × max_charge
-    bid_price = current_price × (1 + 0.5 × action) + premium
-    
-if action < 0:  # Negative = Sell
-    power = |action| × max_discharge
-    ask_price = current_price × (0.8 + 0.4 × (1 + action))
+    bid_price = current_price + bid_premium   # premium scales with price percentile
+
+if action < 0:  # Discharge — place a sell ask
+    power = |action| × max_safe_discharge
+    ask_price = current_price - ask_discount  # discount scales with price percentile
 ```
 
-### Safety Overrides
+**Symbol definitions:**
 
-The policy includes hard limits to prevent the sotrage from completely depeleting:
-
-```python
-# Emergency conditions (override neural network)
-if soc < 0.10:  action = +1.0   # Must charge!
-if soc > 0.90:  action = -1.0   # Must discharge!
-
-# Soft boundaries
-if soc < 0.20:  action = max(action, +0.6)  # Encourage charging
-if soc > 0.80:  action = min(action, -0.6)  # Encourage discharging
-```
+| Symbol | Meaning |
+|--------|---------|
+| `max_charge` | Maximum power the battery can absorb this timestep (kW), derived from SOC |
+| `max_safe_discharge` | Maximum power the battery can release while staying above `soc_floor` |
+| `bid_premium` | Markup above market price to ensure the buy order fills (0.5–1.2 ct/kWh depending on price percentile) |
+| `ask_discount` | Markdown below market price to ensure the sell order fills (0.1–0.4 ct/kWh depending on price percentile) |
+| `\|action\|` | Absolute value of action |
 
 ---
 
 ## 5. Reward Function
 
-The reward signal guides learning. Our reward has three components:
+The reward signal guides learning. It has three components:
 
 ### 5.1 Profit Reward (Primary)
 
 ```python
-energy_cost = price × (bought - sold) / 100  # in €
-profit_reward = -energy_cost × 5.0
+energy_cost_eur = price × (bought - sold) / 100   # actual €
+profit_reward = -energy_cost_eur × penalty_scale
 ```
+
+`penalty_scale` is normally 5.0. It is reduced to 2.5 when SOC < 0.35 and the agent is buying at a non-excessive price — to avoid discouraging necessary recovery charging.
 
 | Transaction | Energy Cost | Profit Reward |
 |-------------|-------------|---------------|
-| Buy 10 kWh @ 5ct | +€0.50 | -€2.50 |
-| Sell 10 kWh @ 8ct | -€0.80 | +€4.00 |
+| Buy 10 kWh @ 5 ct | +€0.50 | -€2.50 |
+| Sell 10 kWh @ 8 ct | -€0.80 | +€4.00 |
 
-**Note:** Negative cost = profit = positive reward
+**Note:** Negative cost = profit = positive reward.
 
-### 5.2 SOC Penalty (Safety)
+**Symbol definitions:**
+
+| Symbol | Meaning |
+|--------|---------|
+| `price` | Current market price in ct/kWh |
+| `bought` | Energy bought this timestep in kWh |
+| `sold` | Energy sold this timestep in kWh |
+| `penalty_scale` | Reward scaling factor (5.0 normally, 2.5 during low-SOC recovery) |
+
+### 5.2 Arbitrage Bonus (Timing)
 
 ```python
-if soc < 0.10:       penalty = -100.0   # Critical!
-elif soc < 0.20:     penalty = -30.0 × (0.20 - soc) / 0.10
-elif soc > 0.90:     penalty = -30.0 × (soc - 0.90) / 0.10
-elif soc > 0.80:     penalty = -10.0 × (soc - 0.80) / 0.10
-else:                penalty = 0.0      # Safe zone
+price_ratio = price / avg_price
+
+if bought > 0:
+    if price_ratio < 0.70:   bonus += 2.0   # Very cheap buy
+    elif price_ratio < 0.85: bonus += 1.0   # Cheap buy
+    elif price_ratio < 0.95: bonus += 0.3   # Slightly cheap buy
+    bonus *= (0.3 + 0.7 × trade_size_norm)  # Scale by trade size
+
+if sold > 0:
+    if price_ratio > 1.30:   bonus += 2.0   # Very expensive sell
+    elif price_ratio > 1.15: bonus += 1.0   # Expensive sell
+    elif price_ratio > 1.05: bonus += 0.3   # Slightly expensive sell
+    bonus *= (0.3 + 0.7 × trade_size_norm)
 ```
 
-### 5.3 Arbitrage Bonus (Timing)
+**Symbol definitions:**
+
+| Symbol | Meaning |
+|--------|---------|
+| `avg_price` | Rolling 24h average of observed market prices |
+| `price_ratio` | Current price divided by avg_price — how expensive this moment is relative to recent history |
+| `trade_size_norm` | Trade size as a fraction of max possible energy per step — rewards larger, more committed trades |
+
+### 5.3 SOC Penalty (Safety)
 
 ```python
-# Reward buying cheap
-if bought > 0 and price < avg_price × 0.80:
-    bonus += 3.0  # Good buy!
-
-# Reward selling expensive  
-if sold > 0 and price > avg_price × 1.20:
-    bonus += 3.0  # Good sell!
+if soc < 0.10:   penalty = -2.0 × (0.10 - soc) / 0.10   # max -2.0 at soc = 0
+elif soc < 0.20: penalty = -0.8 × (0.20 - soc) / 0.10
+elif soc < 0.30: penalty = -0.3 × (0.30 - soc) / 0.10
+elif soc > 0.92: penalty = -2.0 × (soc - 0.92) / 0.08   # max -2.0 at soc = 1
+else:            penalty = 0.0
 ```
+
+The penalty tapers smoothly from the boundary inward, so extreme SOC states are strongly discouraged without creating discontinuous jumps in the reward signal.
 
 ### Total Reward
 
 ```python
-reward = profit_reward + soc_penalty + arbitrage_bonus + soc_center_bonus
+reward = profit_reward + arbitrage_bonus + soc_penalty
 ```
 
 ---
 
 ## 6. Learning Algorithm
 
-### Policy Gradient Method
+### TD Actor-Critic
 
-We use a variant of a type of RL that utilizes gradient ascent to maximize cumulative reward by adjustic its weights.
+The agent uses **Temporal Difference (TD) Actor-Critic** — a two-network architecture that updates weights every episode (every 48 timesteps = 12 hours) using bootstrapped value estimates rather than waiting for full episode returns.
 
-### Experience Memory
+- The **Actor** (policy network) decides what action to take.
+- The **Critic** (value network) estimates how good each state is, providing a training signal for the actor.
 
-Each timestep, we store a transition:
+### Episode Cycle
+
+Each timestep:
 
 ```python
-memory.append((state, action, reward, next_state, hidden, soc))
+# 1. Act
+state = build_state()
+action, raw_action, h1, h1_in = policy(state)   # actor forward pass
+action += gaussian_noise                          # exploration
+place_market_bid_or_ask(action)
+
+# 2. Observe outcome (after market clears)
+reward = compute_reward(bought, sold, price)
+next_state = build_state()
+trajectory.append((state, action, raw_action, reward, next_state, h1, h1_in, soc))
 ```
 
-The memory holds up to 15,000 transitions (~156 days of data).
+After 48 steps, `update_parameters()` runs and the trajectory is cleared.
 
-### Adaptive Learning Rate
+**Symbol definitions:**
+
+| Symbol | Meaning |
+|--------|---------|
+| `raw_action` | tanh(z) before safety overrides — stored so gradients are computed on the clean network output |
+| `h1` | Post-activation hidden vector — stored for backprop |
+| `h1_in` | Pre-activation hidden vector — stored for LeakyReLU derivative during backprop |
+| `trajectory` | On-policy buffer of transitions collected in this episode; cleared after each update |
+
+### The TD Error
+
+At each step, the TD error `δ` measures how wrong the critic's prediction was:
+
+```
+δ = r + γ · V(s') - V(s)
+```
+
+**Symbol definitions:**
+
+| Symbol | Meaning |
+|--------|---------|
+| `δ` (delta) | TD error — the surprise signal. Positive means the outcome was better than expected; negative means worse |
+| `r` | Reward received at this timestep |
+| `γ` (gamma) | Discount factor (0.98) — future rewards are worth slightly less than immediate ones. A reward 1 step away is worth 98% of an immediate reward |
+| `V(s)` | Critic's estimate of the value of the current state s |
+| `V(s')` | Critic's estimate of the value of the next state s' |
+| `γ · V(s')` | Bootstrapped estimate of future value — this is what makes it TD rather than Monte Carlo |
+
+A positive `δ` means the actual outcome was better than the critic predicted → the actor is nudged toward that action. A negative `δ` discourages it.
+
+### Critic Update
+
+The critic is updated 3 times per episode using semi-gradient descent:
+
+```
+θ_critic += critic_lr · δ · ∇V(s)
+```
+
+`V(s')` is computed from a **frozen target critic** (a slowly-updated copy of the critic) to prevent the training target from moving too fast and destabilising learning.
+
+**Symbol definitions:**
+
+| Symbol | Meaning |
+|--------|---------|
+| `θ_critic` | Critic network weights (W1, b1, W2, b2) |
+| `critic_lr` | Critic learning rate (0.05) |
+| `∇V(s)` | Gradient of the critic's value estimate with respect to its weights |
+| `target critic` | A frozen copy of the critic used only to compute `V(s')`. Updated slowly via Polyak averaging |
+
+### Actor Update
+
+After the critic is updated, the actor is updated once using the now-improved critic's TD errors as advantages:
+
+```
+advantage = normalise(δ)
+
+θ_actor += actor_lr · advantage · ∇log π(a|s)
+```
+
+Advantages are **normalised** (zero mean, unit std) across the episode before the update, so large TD spikes do not dominate the gradient.
+
+**Symbol definitions:**
+
+| Symbol | Meaning |
+|--------|---------|
+| `θ_actor` | Actor network weights (W1, b1, W2, b2) |
+| `actor_lr` | Actor learning rate (~0.03, adaptive) |
+| `advantage` | Normalised TD error — how much better/worse this transition was than the episode average |
+| `∇log π(a\|s)` | Policy gradient — direction to update weights to make this action more (or less) likely |
+| `normalise(δ)` | (δ - mean(δ)) / std(δ) — centres and scales the advantages across the episode |
+
+### Target Critic — Polyak Averaging
+
+After each update, the frozen target critic is softly moved toward the current critic:
+
+```
+θ_target = (1 - τ) · θ_target + τ · θ_critic
+```
+
+**Symbol definitions:**
+
+| Symbol | Meaning |
+|--------|---------|
+| `θ_target` | Frozen target critic weights |
+| `τ` (tau) | Polyak averaging coefficient (0.005) — small value means the target moves very slowly, giving stable bootstrap targets |
+
+### Weight Decay
+
+After each actor update, the output weights are slightly shrunk:
+
+```
+W1 *= 0.999
+W2 *= 0.999
+```
+
+This prevents weights from growing large enough to push the tanh output into saturation (where gradients vanish).
+
+### Adaptive Actor Learning Rate
 
 ```python
 if recent_profits > older_profits:
-    lr *= 1.05  # Learning is working, speed up
+    actor_lr *= 1.1   # Working → speed up
 else:
-    lr *= 0.95  # Learning is struggling, slow down
+    actor_lr *= 0.9   # Struggling → slow down
 
-lr = clip(lr, 0.001, 0.015)
+actor_lr = clip(actor_lr, 0.01, 0.08)
 ```
+
+### Best-Weights Restore
+
+If profit does not improve for 10 consecutive episodes, the agent automatically reverts actor and critic weights to the best-performing checkpoint.
 
 ---
 
@@ -280,97 +422,30 @@ lr = clip(lr, 0.001, 0.015)
 
 ### Learning Parameters
 
-Applied directly to the weights.
-
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `learning_rate` | 0.008 | Step size for weight updates |
-| `gamma` | 0.98 | Discount factor (not actively used) |
-| `batch_size` | 64 | Samples per update |
-| `memory_size` | 15,000 | Maximum stored transitions |
-| `update_frequency` | 96 | Timesteps between updates (1 day) |
+| `actor_lr` | 0.03 | Actor learning rate (adaptive, range 0.01–0.08) |
+| `critic_lr` | 0.05 | Critic learning rate |
+| `gamma` | 0.98 | Discount factor for TD error: r + γ·V(s') |
+| `update_frequency` | 48 steps | Episode length (12 hours at 15-min timesteps) |
+| `critic_passes` | 3 | Critic gradient steps per episode |
+| `target_update_tau` | 0.005 | Polyak coefficient for target critic soft-update |
+| `restore_patience` | 10 episodes | Episodes below best profit before reverting to best weights |
 
 ### Exploration Parameters
 
-Applied to the "buy/sell action"
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `exploration_rate` | 0.35 | Initial Gaussian noise std added to action |
+| `exploration_decay` | 0.997 | Multiplied each episode |
+| `min_exploration` | 0.08 | Floor — exploration never drops below this |
+
+### SOC Boundaries
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `exploration_rate` | 0.35 | Initial noise level |
-| `exploration_decay` | 0.997 | Decay per episode |
-| `min_exploration` | 0.08 | Minimum noise level |
-
----
-
-## 8. What We Are Contributing — TD Actor-Critic (`algo/temporal-difference`)
-
-The original implementation used a Monte Carlo policy gradient: weights were updated once per episode using the full cumulative return. This branch replaces it with a **Temporal Difference (TD) Actor-Critic**, which bootstraps value estimates at every timestep and produces much faster, lower-variance learning.
-
-### 8.1 From Monte Carlo to TD Actor-Critic
-
-| Property | Monte Carlo (old) | TD Actor-Critic (this branch) |
-|----------|------------------|-------------------------------|
-| Update frequency | Once per episode (end of day) | Every timestep (online) |
-| Return estimate | Full rollout `G_t` | Bootstrapped: `r + γ·V(s')` |
-| Variance | High | Low |
-| Bias | None | Small (from bootstrapping) |
-| Separate critic | No | Yes — linear value function |
-
-### 8.2 The Critic (Value Function)
-
-A linear critic approximates how good each state is. It is trained separately from the actor:
-
-```python
-V(s) = soc_w × (soc - target)
-     + soc_sq_w × (soc - target)²
-     + price_w × price_norm
-     + price_diff_w × price_diff
-     + hour_w × sin(hour)
-     + bias
-```
-
-Warm-started with `soc_sq_w = -1.0` so the critic immediately penalises extreme SOC states before any learning has occurred.
-
-### 8.3 The TD Update Rule
-
-At each timestep the TD error `δ` measures how wrong the critic's prediction was:
-
-```
-δ = r + γ·V(s') - V(s)        ← TD error (prediction error)
-
-critic: θ_v += critic_lr · δ · ∇V(s)    ← make prediction more accurate
-actor:  θ_π += actor_lr · δ · ∇log π    ← reinforce good actions
-```
-
-A positive `δ` means the outcome was better than expected → the actor is nudged toward the action that caused it. A negative `δ` discourages that action.
-
-### 8.4 Network Architecture Changes
-
-The hidden layer was widened from **1 neuron to 4 neurons** to allow the policy to learn interactions between features (e.g. "low price AND rising forecast AND low SOC → strong buy"):
-
-```
-Input (9) → W1 [4×9] + b1 [4] → LeakyReLU → W2 [1×4] + b2 [1] → Tanh → action
-```
-
-Weights are stored as numpy arrays (`W1`, `b1`, `W2`, `b2`) rather than the old named-key dict.
-
-### 8.5 Bug Fixes & Design Improvements
-
-Several bugs were found and fixed during this branch:
-
-| # | Bug | Fix |
-|---|-----|-----|
-| 1 | `value_theta` missing `"bias"` key → critic crashed every run | Added `"bias": 0.0` with warm-start |
-| 2 | Two weights both received `price_diff_1h` → redundant, one weight never learned | Corrected to separate `price_diff` and `forecast_1h` inputs |
-| 3 | `get_average_price` sliced a static array → data leakage from future prices | Replaced with a rolling `price_history` deque (only seen prices) |
-| 4 | Tanh gradient used the post-processed (clipped) action → wrong gradient | Stored `raw_action = tanh(z)` separately; gradient computed from that |
-
-Additional design improvements:
-
-- **Ask price:** changed from `price × 0.92` (always underselling) to `price × (1.0 + 0.05 × |action|)` — the agent now sells at or above market
-- **SOC penalty:** reduced maximum from −20 to −3 and replaced hard steps with a smooth taper, reducing reward spikes that disrupted learning
-- **Bias blend in policy:** reduced from 40% to 10% — the network now dominates over the hand-coded prior, improving credit assignment
-- **Weight decay:** `W1 × 0.999` and `W2 × 0.999` each update, preventing weights from growing into tanh saturation
-- **Adaptive actor learning rate:** scales between 0.01–0.08 based on whether recent profits exceed older profits
+| `soc_floor` | 0.10 | Below this: charge-only mode (no discharge allowed) |
+| `soc_ceiling` | 0.85 | Operating ceiling for normal discharge planning |
+| `soc_target` | 0.50 | Centre of the safe operating range |
 
 ---

@@ -18,6 +18,7 @@ logging.basicConfig(level=logging.ERROR)
 import warnings
 warnings.simplefilter("ignore", category=FutureWarning)
 import gc
+from mesa_model.sac import SACLearner
 
 def initialize(self, typ, factor, cosphi, bus):
     self.typ=typ
@@ -434,77 +435,69 @@ class storage(mesa.Agent):
         self.coefficients_ask = [0, 0]
         self.coefficients_bid = [0, 0]
         
-        # Reinforcement Learning parameters
+        # ---- Soft Actor-Critic (SAC) learning setup ----
         if self.method == "learning":
-            # Neural network weights
-            self.theta = {
-                "layer1": {
-                    "soc_w": -5.0,       
-                    "price_w": -1.5,      
-                    "price_diff_w": 0.8,  
-                    "forecast_1h_w": 0.5,
-                    "forecast_4h_w": 0.5,
-                    "time_w": 0.1,       
-                    "dow_w": 0.0,
-                    "bias": -0.3,        
-                },
-                "layer2": {
-                    "hidden_w": 1.8,      
-                    "bias": -0.2,         
-                }
-            }
-            
-            # Learning parameters
-            self.learning_rate = 0.008
-            self.gamma = 0.98
-            self.memory = deque(maxlen=15000)
-            self.batch_size = 64
-            
-            # Tracking variables
-            self.last_state = None
-            self.last_action = None
-            self.last_hidden = None
-            self.episode_rewards = []
-            self.episode_profits = []
-            self.cumulative_reward = 0
-            self.cumulative_profit = 0
-            self.cumulative_bought = 0
-            self.cumulative_sold = 0
-            self.update_frequency = 48
-            self.episode_counter = 0
-            
-            # Exploration parameters
-            self.exploration_rate = 0.35
-            self.exploration_decay = 0.997
-            self.min_exploration = 0.08
-            
-            # Performance tracking
-            self.best_profit = -np.inf
-            self.best_theta = None
-            self.soc_history = []
-            
-            # SOC operating range
-            self.soc_floor = 0.10       # Emergency low
-            self.soc_ceiling = 0.85     # Emergency high
-            self.soc_target = 0.50      # Target center
+            self._setup_learning()
 
-            self._price_index = None
-            self._price_array = None
-            self._price_cache_ready = False
+    def _setup_learning(self):
+        """Initialise SAC learner + bookkeeping for the learning method."""
+        # 16-D state (see build_state / docs/redesign-plan.md)
+        self.state_dim = 16
+        self.gamma = 0.99           # ≈25 h horizon: spans the daily price cycle
+        self.reward_scale = 10.0    # lift tiny per-step € rewards above the entropy term
 
-            # Rolling observed price history — no future data leakage
-            self.price_history = deque(maxlen=96)
-            # Per-episode trajectory for true MC returns
-            self.episode_buffer = []
+        self.learner = SACLearner(
+            state_dim=self.state_dim,
+            gamma=self.gamma,
+            tau=0.005,
+            lr=3e-4,
+            target_entropy=-1.0,
+            buffer_size=100_000,
+            batch_size=256,
+            warmup_steps=500,     # sim is ~8.5k steps total; keep warm-up a small fraction
+            actor_update_every=2,
+            reward_scale=self.reward_scale,
+            seed=42,
+        )
 
-            # Trade tracking for episode logging
-            self.trade_count_buy = 0
-            self.trade_count_sell = 0
-            self.buy_price_sum = 0.0
-            self.sell_price_sum = 0.0
-            # Return stats set by update_parameters() for the log
-            self.last_avg_return = 0.0
-            self.last_return_std = 0.0
+        # Transition assembly across step() → update_status()
+        self.last_state = None
+        self.last_action = None
+        self.last_decision_price = None   # price the agent saw when it acted (settlement price)
+        self.last_soc = None              # SOC going into the acted step
+        self.last_override_active = False # safety override fired → exclude from replay
+
+        # Logging cadence (SAC learns every step; this only groups the logs)
+        self.update_frequency = 96        # 1 day
+        self.episode_counter = 0
+        self.episode_profits = []
+        self.cumulative_reward = 0.0
+        self.cumulative_profit = 0.0      # realised cash (€)
+        self.cumulative_bought = 0.0
+        self.cumulative_sold = 0.0
+        self.last_diagnostics = {}
+
+        # SOC operating range — soft band left to the policy; hard limits in §7
+        self.soc_floor = 0.20
+        self.soc_ceiling = 0.85
+        self.soc_target = 0.50
+        self.soc_history = []
+
+        # Price caches / observed-history buffers (no future leakage)
+        self._price_index = None
+        self._price_array = None
+        self._price_cache_ready = False
+        self.price_history = deque(maxlen=96)          # last 24 h of observed prices
+        self._price_lag_1h = deque(maxlen=4)           # 4 × 15 min = 1 h
+        self._price_lag_4h = deque(maxlen=16)          # 16 × 15 min = 4 h
+        self.hourly_price_ewma = {}                    # causal hour-of-day baseline
+        self.hourly_ewma_beta = 0.05
+
+        # Trade tracking for episode logging
+        self.trade_count_buy = 0
+        self.trade_count_sell = 0
+        self.buy_price_sum = 0.0
+        self.sell_price_sum = 0.0
 
     def provide_a_power(self):
         a_power_discharge = min(
@@ -548,443 +541,275 @@ class storage(mesa.Agent):
             pass
         return 30.0
 
-    def get_price_forecast(self, hours_ahead):
-        if not self._price_cache_ready:
-            self._initialize_price_cache()
-        
-        try:
-            steps_ahead = int(hours_ahead * 3600 / self.model.timestep.seconds)
-            forecast_time = self.model.current_date + self.model.timestep * steps_ahead
-            
-            if self._price_cache_ready and self._price_index:
-                price = self._price_index.get(forecast_time)
-                if price is not None:
-                    return float(price)
-        except (AttributeError, IndexError, KeyError, TypeError):
-            pass
-        return self.get_current_price()
-
-    def get_average_price(self, hours_back=24):
-        try:
-            steps_back = int(hours_back * 3600 / self.model.timestep.seconds)
-            recent_prices = list(self.price_history)[-steps_back:]
-            if len(recent_prices) > 0:
-                return float(np.mean(recent_prices))
-        except (AttributeError, TypeError):
-            pass
-        return self.get_current_price()
-
-    def get_price_percentile(self, hours_back=24):
-        try:
-            steps_back = int(hours_back * 3600 / self.model.timestep.seconds)
-            current_price = self.get_current_price()
-            recent_prices = np.array(list(self.price_history)[-steps_back:])
-            if len(recent_prices) > 0:
-                return float(np.sum(recent_prices < current_price) / len(recent_prices))
-        except (AttributeError, TypeError):
-            pass
-        return 0.5
-
     def build_state(self):
-        """Build state representation for RL policy."""
+        """16-D state vector (see docs/redesign-plan.md §4).
+
+        All price-derived features use only the rolling observed-price buffers
+        populated in update_status — no future data is read.
+        """
+        eps = 1e-6
+
+        def clip(x, lo=-5.0, hi=5.0):
+            return float(np.clip(x, lo, hi))
+
+        p = self.get_current_price()
+        hist = (np.asarray(self.price_history, dtype=float)
+                if len(self.price_history) > 0 else np.array([p], dtype=float))
+        mean = float(hist.mean())
+        std = float(hist.std())
+
         soc = float(self.soc)
-        max_discharge, max_charge = self.provide_a_power()
-        
-        price_now = self.get_current_price()
-        price_forecast_1h = self.get_price_forecast(1)
-        price_forecast_4h = self.get_price_forecast(4)
-        avg_price = self.get_average_price(24)
-        price_percentile = self.get_price_percentile(24)
-        
-        price_norm = (price_now - avg_price) / (avg_price + 1e-6)
-        price_diff_1h = (price_forecast_1h - price_now) / (price_now + 1e-6)
-        price_diff_4h = (price_forecast_4h - price_now) / (price_now + 1e-6)
-        
-        current_time = self.model.current_date
-        hour_norm = current_time.hour / 23.0
-        dow_norm = current_time.weekday() / 6.0
-        
-        return [soc, float(max_discharge), float(max_charge), price_norm, 
-                price_diff_1h, price_diff_4h, hour_norm, dow_norm, price_percentile]
+        span = (self.soc_ceiling - self.soc_floor) + eps
+        headroom_ceiling = clip((self.soc_ceiling - soc) / span)
+        headroom_floor = clip((soc - self.soc_floor) / span)
 
-    def policy(self, state):
-        """Two-layer neural network policy with MINIMAL overrides."""
-        soc, max_discharge, max_charge, price_norm, price_diff_1h, price_diff_4h, hour_norm, dow_norm, price_percentile = state
-        
-        # Neural network forward pass
-        h1_input = (
-            self.theta["layer1"]["soc_w"] * (soc - self.soc_target) +
-            self.theta["layer1"]["price_w"] * price_norm +
-            self.theta["layer1"]["price_diff_w"] * price_diff_1h +
-            self.theta["layer1"]["forecast_1h_w"] * price_diff_1h +
-            self.theta["layer1"]["forecast_4h_w"] * price_diff_4h +
-            self.theta["layer1"]["time_w"] * hour_norm +
-            self.theta["layer1"]["dow_w"] * dow_norm +
-            self.theta["layer1"]["bias"]
-        )
-        
-        # LeakyReLU activation
-        h1 = np.where(h1_input > 0, h1_input, 0.1 * h1_input)
-        h1 = np.clip(h1, -5.0, 5.0)
-        
-        z = self.theta["layer2"]["hidden_w"] * h1 + self.theta["layer2"]["bias"]
-        action = np.tanh(z)
+        price_norm = clip((p - mean) / (std + eps)) if std > eps else 0.0
+        percentile = float(np.mean(hist < p)) if len(hist) > 1 else 0.5
 
-        # Hard safety overrides (emergencies only)
-        if soc < 0.10:
-            action = 1.0
-        elif soc > 0.95:
-            action = -1.0
+        base_h = self.hourly_price_ewma.get(self.model.current_date.hour, mean)
+        price_vs_base = clip((p - base_h) / (base_h + eps))
 
-        if 0.25 < soc < 0.75:
-            exploration = max(self.min_exploration, self.exploration_rate)
-            noise = np.random.normal(0, exploration * 0.3)
-            action += noise
-        
-        action = np.clip(action, -1, 1)
+        p1 = (self._price_lag_1h[0]
+              if len(self._price_lag_1h) == self._price_lag_1h.maxlen else p)
+        p4 = (self._price_lag_4h[0]
+              if len(self._price_lag_4h) == self._price_lag_4h.maxlen else p)
+        mom_1h = clip(p / (p1 + eps) - 1.0)
+        mom_4h = clip(p / (p4 + eps) - 1.0)
 
-        if price_percentile < 0.15 and soc < 0.60:
-            action += 0.25  
-        elif price_percentile > 0.85 and soc > 0.35:
-            action -= 0.25  
-        
-        action = np.clip(action, -1, 1)
-        
-        return action, h1
+        vol = clip(std / (mean + eps), 0.0, 5.0)
+
+        mb = float(getattr(self.model, "market_price_margin_buy", 1.0))
+        ms = float(getattr(self.model, "market_price_margin_sell", 0.3))
+        spread_norm = clip((mb + ms) / (p + mb + eps), 0.0, 5.0)
+
+        t = self.model.current_date
+        hour_rad = 2 * np.pi * t.hour / 24.0
+        dow_rad = 2 * np.pi * t.weekday() / 7.0
+        mon_rad = 2 * np.pi * (t.month - 1) / 12.0
+
+        return [soc, headroom_ceiling, headroom_floor, price_norm, percentile,
+                price_vs_base, mom_1h, mom_4h, vol, spread_norm,
+                float(np.sin(hour_rad)), float(np.cos(hour_rad)),
+                float(np.sin(dow_rad)), float(np.cos(dow_rad)),
+                float(np.sin(mon_rad)), float(np.cos(mon_rad))]
 
     def action_to_bid(self, action):
-        """Convert RL action to market bid/ask."""
+        """Map SAC action ∈ [-1, 1] to a price-taking market bid/ask.
+
+        The agent learns *when* and *how much* to trade; the price is a fixed
+        small spread around the current market price, just enough to clear
+        against the external-grid margin. Emergencies use aggressive prices to
+        guarantee a fill. Action sign: +charge, -discharge.
+        """
         self.ask = [0, 0, self.offer_function(0), "lin"]
         self.bid = [0, 0, self.offer_function(0), "lin"]
         self.coefficients_ask = [0, 0]
         self.coefficients_bid = [0, 0]
-        
+
         max_discharge, max_charge = self.provide_a_power()
         eps = 1e-6
-        price_now = self.get_current_price()
+        p = self.get_current_price()
+        spread = 0.2   # ct/kWh
 
-        # Emergency charge: SOC critically low
+        # --- Emergency charge: SOC critically low ---
         if self.soc < 0.10:
             if max_charge > eps:
                 bid_price = 1000.0
-                bid_fun = self.offer_function(bid_price)
-                self.bid = [max_charge, max_charge, bid_fun, "lin"]
+                self.bid = [max_charge, max_charge, self.offer_function(bid_price), "lin"]
                 self.coefficients_bid = [0, bid_price * (self.model.timestep.seconds / 3600)]
             return
 
-        # Below floor: allow charge-only (keep RL magnitude, forbid discharge)
-        if self.soc < self.soc_floor:
-            action = max(action, 0.0)
+        # --- Emergency discharge: SOC critically high ---
+        if self.soc > 0.95:
+            if max_discharge > eps:
+                ask_price = 0.01
+                self.ask = [max_discharge, max_discharge, self.offer_function(ask_price), "lin"]
+                self.coefficients_ask = [0, ask_price * (self.model.timestep.seconds / 3600)]
+            return
 
-        # Safe discharge ceiling
-        if self.soc > self.soc_floor:
-            max_safe_discharge_kwh = (self.soc - self.soc_floor) * self.capacity
-            max_safe_discharge_power = max_safe_discharge_kwh * (3600 / self.model.timestep.seconds) / self.model.sref * self.efficiency
-            max_safe_discharge = min(max_discharge, max_safe_discharge_power)
-        else:
-            max_safe_discharge = 0
-
-        price_percentile = self.get_price_percentile()
-
-        if action > eps:
-            desired_power = min(action * max_charge, max_charge)
-            if desired_power > eps:
-                if price_percentile < 0.15:
-                    bid_premium = 0.5
-                elif price_percentile < 0.35:
-                    bid_premium = 0.8
-                else:
-                    bid_premium = 1.2
-                lec_min = self.model.gridfee_LEC + self.model.levies_LEC
-                bid_price = max(price_now + bid_premium, lec_min + bid_premium)
-                bid_fun = self.offer_function(bid_price)
-                self.bid = [0, desired_power, bid_fun, "lin"]
+        if action > eps:        # charge
+            power = min(action * max_charge, max_charge)
+            if power > eps:
+                bid_price = p + spread
+                self.bid = [0, power, self.offer_function(bid_price), "lin"]
                 self.coefficients_bid = [0, bid_price * (self.model.timestep.seconds / 3600)]
 
-        elif action < -eps:
-            desired_power = min(-action * max_discharge, max_safe_discharge)
-            if desired_power > eps:
-                if price_percentile > 0.85:
-                    ask_discount = 0.1
-                elif price_percentile > 0.65:
-                    ask_discount = 0.25
-                else:
-                    ask_discount = 0.4
-                ask_price = max(price_now - ask_discount, 0.01)
-                ask_fun = self.offer_function(ask_price)
-                self.ask = [0, desired_power, ask_fun, "lin"]
+        elif action < -eps:     # discharge
+            power = min(-action * max_discharge, max_discharge)
+            if power > eps:
+                ask_price = max(p - spread, 0.01)
+                self.ask = [0, power, self.offer_function(ask_price), "lin"]
                 self.coefficients_ask = [0, ask_price * (self.model.timestep.seconds / 3600)]
 
-    def compute_reward(self, bought, sold, price):
+    def compute_reward(self, bought, sold, p_decision, p_now, soc_old, soc_new):
+        """Mark-to-market wealth change in € (see docs/redesign-plan.md §3).
 
-        avg_price = self.get_average_price(24)
-        
+            reward = cashflow + Δ(inventory value)
+                   = (sold − bought)·p_decision/100
+                     + (p_now·soc_new − p_decision·soc_old)·capacity/100
 
-        # PRIMARY: Profit/Loss 
-        energy_cost = price * (bought - sold) / 100
-        profit_reward = -energy_cost * 5.0  # Strong reward on actual profit
-        
+        Cash flow values the trade at the price the agent saw when it acted
+        (p_decision); the inventory term revalues stored energy at the now-
+        observed price (p_now). Both are observed — no future leakage. This
+        removes the bias against buying that a per-step cash-flow reward has.
 
-        # SECONDARY: SOC penalties (only at extremes)
-        soc_penalty = 0
-        if self.soc < 0.10:
-            soc_penalty = -100.0
-        elif self.soc < 0.20:
-            soc_penalty = -30.0 * (0.20 - self.soc) / 0.10
-        elif self.soc > 0.90:
-            soc_penalty = -30.0 * (self.soc - 0.90) / 0.10
-        elif self.soc > self.soc_ceiling:
-            soc_penalty = -10.0 * (self.soc - self.soc_ceiling) / 0.10
-        
+        Returned raw (in €); the SACLearner applies reward_scale.
+        """
+        cashflow = (sold - bought) * p_decision / 100.0
+        inventory_delta = (p_now * soc_new - p_decision * soc_old) * self.capacity / 100.0
+        reward = cashflow + inventory_delta
 
-        # TERTIARY: Arbitrage bonus (reward good timing)
-        arbitrage_bonus = 0
-        
-        if bought > 0.1:
-            if price < avg_price * 0.80:
-                arbitrage_bonus += 3.0   # Good buy (cheap)
-            elif price > avg_price * 1.10:
-                arbitrage_bonus -= 2.0   # Bad buy (expensive)
-        
-        if sold > 0.1:
-            if price > avg_price * 1.20:
-                arbitrage_bonus += 3.0   # Good sell (expensive)
-            elif price < avg_price * 0.90:
-                arbitrage_bonus -= 2.0   # Bad sell (cheap)
-        
+        # Hard-limit penalty only — soft band (0.20–0.85) is left to the policy
+        if soc_new < 0.05 or soc_new > 0.97:
+            reward -= 0.5
 
-        # SMALL: SOC centering bonus (gentle pull toward target)
-        soc_center_bonus = 0
-        if 0.40 <= self.soc <= 0.60:
-            soc_center_bonus = 1.0  
-        
-        return profit_reward + soc_penalty + arbitrage_bonus + soc_center_bonus
+        return reward
 
     def update_status(self):
-        """Update SOC and perform RL learning update."""
+        """Apply the settled trade to SOC and run one SAC learning step.
+
+        Called at time τ+1. Reads the trade that cleared at τ, updates SOC,
+        builds the (s_τ, a_τ, r_τ, s_{τ+1}) transition with a leakage-free
+        mark-to-market reward, pushes it to replay, and runs one SAC update.
+        """
         if len(self.model.results) == 0:
             return
-        
+
         try:
             result = self.model.results[int(self.model.stepcount - 1)]["agents"]
             result = result[result["Agent ID"] == self.unique_id]
         except (KeyError, IndexError):
             return
-        
+
         if len(result) == 0:
             return
-        
-        bought = result["Energy bought [kWh]"].to_numpy()[0]
-        sold = result["Energy sold [kWh]"].to_numpy()[0]
-        
-        # Store old SOC
+
+        bought = float(result["Energy bought [kWh]"].to_numpy()[0])
+        sold = float(result["Energy sold [kWh]"].to_numpy()[0])
+
         old_soc = self.soc
-        
-        # Update SOC
         energy_delta = bought * self.efficiency - sold / self.efficiency
         soc_delta = energy_delta / self.capacity
         self.soc = min(max((old_soc * self.discharge) + soc_delta, 0), 1)
-        
-        # RL Learning update
-        if self.method == "learning":
-            
-            self.cumulative_bought += bought
-            self.cumulative_sold += sold
-            
-            self.soc_history.append(self.soc)
-            if len(self.soc_history) > 2000:
-                self.soc_history = self.soc_history[-2000:]
-            
-            if self.last_state is not None and self.last_action is not None:
-                price = self.get_current_price()
-                self.price_history.append(price)
 
-                reward = self.compute_reward(bought, sold, price)
-                self.cumulative_reward += reward
-
-                actual_cost = price * (bought - sold) / 100
-                self.cumulative_profit -= actual_cost
-
-                self.episode_buffer.append((self.last_state, self.last_action, reward, self.last_hidden))
-
-                if bought > 0.01:
-                    self.trade_count_buy += 1
-                    self.buy_price_sum += price
-                if sold > 0.01:
-                    self.trade_count_sell += 1
-                    self.sell_price_sum += price
-
-                next_state = self.build_state()
-                self.memory.append((
-                    self.last_state,
-                    self.last_action,
-                    reward,
-                    next_state,
-                    self.last_hidden,
-                    self.soc
-                ))
-                self.last_state = next_state
-                
-                # Episode summary
-                if self.model.stepcount % self.update_frequency == 0:
-                    self.episode_counter += 1
-                    self.update_parameters()
-                    
-                    recent_soc = self.soc_history[-96:] if len(self.soc_history) >= 96 else self.soc_history
-                    avg_soc = np.mean(recent_soc) if recent_soc else self.soc
-                    min_soc = np.min(recent_soc) if recent_soc else self.soc
-                    max_soc = np.max(recent_soc) if recent_soc else self.soc
-                    
-                    print(f"\n{'='*60}")
-                    print(f"[Storage {self.unique_id}] Episode {self.episode_counter} Summary")
-                    print(f"{'='*60}")
-                    print(f"  Cumulative Reward:   {self.cumulative_reward:>12.2f}")
-                    print(f"  Actual Profit (€):   {self.cumulative_profit:>12.4f}")
-                    print(f"  Energy Bought (kWh): {self.cumulative_bought:>12.2f}")
-                    print(f"  Energy Sold (kWh):   {self.cumulative_sold:>12.2f}")
-                    print(f"  Net Energy (kWh):    {self.cumulative_bought - self.cumulative_sold:>12.2f}")
-                    print(f"  Exploration Rate:    {self.exploration_rate:>12.4f}")
-                    print(f"  Memory Size:         {len(self.memory):>12d}")
-                    print(f"  Current SOC:         {self.soc*100:>12.1f}%")
-                    print(f"  SOC Range (24h):     {min_soc*100:>6.1f}% - {max_soc*100:.1f}%")
-                    print(f"  Avg SOC (24h):       {avg_soc*100:>12.1f}%")
-                    print(f"{'='*60}")
-                    
-                    if self.cumulative_profit > self.best_profit:
-                        self.best_profit = self.cumulative_profit
-                        self.best_theta = {
-                            "layer1": {k: v for k, v in self.theta["layer1"].items()},
-                            "layer2": {k: v for k, v in self.theta["layer2"].items()}
-                        }
-                        print(f"  *** New best profit: €{self.best_profit:.4f} ***")
-                    
-                    # Weekly summary
-                    if self.episode_counter % 7 == 0:
-                        if len(self.episode_profits) >= 7:
-                            weekly_profit = sum(self.episode_profits[-7:])
-                            print(f"\n  Week {self.episode_counter // 7} Summary:")
-                            print(f"    Weekly Profit: €{weekly_profit:.2f}")
-                            print(f"    Best Profit:   €{self.best_profit:.4f}")
-                    
-                    self.episode_rewards.append(self.cumulative_reward)
-                    self.episode_profits.append(self.cumulative_profit)
-
-                    self._log_episode(avg_soc, min_soc, max_soc)
-                    self._reset_episode_counters()
-
-                    self.exploration_rate *= self.exploration_decay
-                    self.exploration_rate = max(self.exploration_rate, self.min_exploration)
-
-    def update_parameters(self):
-        """Update network using true Monte Carlo returns over the completed episode."""
-        if len(self.episode_buffer) < 2:
-            self.episode_buffer = []
+        if self.method != "learning":
             return
 
-        # Compute discounted returns backwards: G_t = r_t + γ·r_{t+1} + ...
-        returns = []
-        G = 0.0
-        for (_, _, reward, _) in reversed(self.episode_buffer):
-            G = reward + self.gamma * G
-            returns.insert(0, G)
-        returns = np.array(returns)
+        new_soc = self.soc
+        p_now = self.get_current_price()           # price at τ+1 (now observed)
+        p_decision = (self.last_decision_price
+                      if self.last_decision_price is not None else p_now)
 
-        # Store raw stats for episode log before normalizing
-        self.last_avg_return = float(np.mean(returns))
-        self.last_return_std = float(np.std(returns))
+        # Update observed-price buffers (causal) BEFORE building next_state
+        self.price_history.append(p_now)
+        self._price_lag_1h.append(p_now)
+        self._price_lag_4h.append(p_now)
+        h = self.model.current_date.hour
+        self.hourly_price_ewma[h] = (
+            (1 - self.hourly_ewma_beta) * self.hourly_price_ewma.get(h, p_now)
+            + self.hourly_ewma_beta * p_now
+        )
 
-        # Normalize to reduce variance
-        if np.std(returns) > 1e-8:
-            returns = (returns - np.mean(returns)) / (np.std(returns) + 1e-8)
+        self.soc_history.append(new_soc)
+        if len(self.soc_history) > 2000:
+            self.soc_history = self.soc_history[-2000:]
 
-        # Adapt learning rate based on recent profit trend
-        lr = self.learning_rate
-        if len(self.episode_profits) >= 6:
-            recent = np.mean(self.episode_profits[-3:])
-            older = np.mean(self.episode_profits[-6:-3])
-            if recent > older:
-                lr *= 1.05
-            else:
-                lr *= 0.95
-            lr = np.clip(lr, 0.001, 0.015)
+        self.cumulative_bought += bought
+        self.cumulative_sold += sold
 
-        grad_layer1 = {k: 0.0 for k in self.theta["layer1"]}
-        grad_layer2 = {k: 0.0 for k in self.theta["layer2"]}
+        if self.last_state is not None and self.last_action is not None:
+            reward = self.compute_reward(bought, sold, p_decision, p_now, old_soc, new_soc)
+            self.cumulative_reward += reward
+            self.cumulative_profit += (sold - bought) * p_decision / 100.0   # realised cash (€)
 
-        for i, (state, action, _, h1) in enumerate(self.episode_buffer):
-            advantage = returns[i]
-            soc_state = state[0]
-            price_norm = state[3]
-            price_diff_1h = state[4]
-            price_diff_4h = state[5]
-            hour_norm = state[6]
-            dow_norm = state[7]
+            if bought > 0.01:
+                self.trade_count_buy += 1
+                self.buy_price_sum += p_decision
+            if sold > 0.01:
+                self.trade_count_sell += 1
+                self.sell_price_sum += p_decision
 
-            grad_output = advantage * (1 - action**2)
-            leaky_relu_deriv = 1.0 if h1 > 0 else 0.1
-            grad_hidden = grad_output * self.theta["layer2"]["hidden_w"] * leaky_relu_deriv
+            next_state = self.build_state()
 
-            grad_layer2["hidden_w"] += grad_output * h1
-            grad_layer2["bias"] += grad_output
+            # Forced-override steps are not policy decisions → keep them out of replay
+            if not self.last_override_active:
+                self.learner.push(self.last_state, self.last_action, reward, next_state, 0.0)
 
-            grad_layer1["soc_w"] += grad_hidden * (soc_state - self.soc_target)
-            grad_layer1["price_w"] += grad_hidden * price_norm
-            grad_layer1["price_diff_w"] += grad_hidden * price_diff_1h
-            grad_layer1["forecast_1h_w"] += grad_hidden * price_diff_1h
-            grad_layer1["forecast_4h_w"] += grad_hidden * price_diff_4h
-            grad_layer1["time_w"] += grad_hidden * hour_norm
-            grad_layer1["dow_w"] += grad_hidden * dow_norm
-            grad_layer1["bias"] += grad_hidden
+            diag = self.learner.update()
+            if diag:
+                # merge so actor-only fields (entropy) persist across critic-only steps
+                self.last_diagnostics.update(diag)
 
-        n = len(self.episode_buffer)
-        max_grad = 0.3
-        for key in self.theta["layer1"]:
-            grad = np.clip(grad_layer1[key] / n, -max_grad, max_grad)
-            self.theta["layer1"][key] += lr * grad
+            if self.model.stepcount % self.update_frequency == 0:
+                self.episode_counter += 1
+                self._print_episode_summary()
+                self._log_episode()
+                self._reset_episode_counters()
 
-        for key in self.theta["layer2"]:
-            grad = np.clip(grad_layer2[key] / n, -max_grad, max_grad)
-            self.theta["layer2"][key] += lr * grad
+    def _print_episode_summary(self):
+        recent = self.soc_history[-96:] if len(self.soc_history) >= 96 else self.soc_history
+        avg_soc = float(np.mean(recent)) if recent else self.soc
+        min_soc = float(np.min(recent)) if recent else self.soc
+        max_soc = float(np.max(recent)) if recent else self.soc
+        d = self.last_diagnostics
 
-        self.episode_buffer = []
+        print(f"\n{'='*60}")
+        print(f"[Storage {self.unique_id}] Episode {self.episode_counter} (SAC)")
+        print(f"{'='*60}")
+        print(f"  Cumulative Reward:   {self.cumulative_reward:>12.2f}")
+        print(f"  Actual Profit (€):   {self.cumulative_profit:>12.4f}")
+        print(f"  Energy Bought (kWh): {self.cumulative_bought:>12.2f}")
+        print(f"  Energy Sold (kWh):   {self.cumulative_sold:>12.2f}")
+        print(f"  Net Energy (kWh):    {self.cumulative_bought - self.cumulative_sold:>12.2f}")
+        print(f"  Buffer Size:         {len(self.learner.buffer):>12d}")
+        print(f"  Alpha (entropy):     {self.learner.alpha.item():>12.4f}")
+        print(f"  Current SOC:         {self.soc*100:>12.1f}%")
+        print(f"  SOC Range (24h):     {min_soc*100:>6.1f}% - {max_soc*100:.1f}%")
+        print(f"  Avg SOC (24h):       {avg_soc*100:>12.1f}%")
+        if d:
+            print(f"  Critic Loss:         {d.get('critic_loss', float('nan')):>12.4f}")
+            print(f"  Entropy:             {d.get('entropy', float('nan')):>12.4f}")
+        print(f"{'='*60}", flush=True)
 
-        print(f"[Storage {self.unique_id}] MC update: {n} steps, mean G={np.mean(returns):.4f}, std G={np.std(returns):.4f} (lr={lr:.4f})")
-        print(f"  Layer 1 - SOC: {self.theta['layer1']['soc_w']:.4f}, Price: {self.theta['layer1']['price_w']:.4f}, Bias: {self.theta['layer1']['bias']:.4f}")
-        print(f"  Layer 2 - Hidden: {self.theta['layer2']['hidden_w']:.4f}, Bias: {self.theta['layer2']['bias']:.4f}")
-
-    def _log_episode(self, soc_avg, soc_min, soc_max):
+    def _log_episode(self):
         import json, os
-        os.makedirs("output/mc", exist_ok=True)
+        os.makedirs("output/sac", exist_ok=True)
+        recent = self.soc_history[-96:] if len(self.soc_history) >= 96 else self.soc_history
+        soc_arr = np.array(recent) if recent else np.array([self.soc])
         avg_buy_price = self.buy_price_sum / self.trade_count_buy if self.trade_count_buy > 0 else 0.0
         avg_sell_price = self.sell_price_sum / self.trade_count_sell if self.trade_count_sell > 0 else 0.0
+        d = self.last_diagnostics
         record = {
-            "algorithm": "mc",
+            "algorithm": "sac",
             "agent_id": int(self.unique_id),
-            "episode": self.episode_counter,
+            "episode": int(self.episode_counter),
             "timestamp": str(self.model.current_date),
-            "cumulative_reward": round(self.cumulative_reward, 4),
-            "actual_profit_eur": round(self.cumulative_profit, 4),
-            "energy_bought_kwh": round(self.cumulative_bought, 4),
-            "energy_sold_kwh": round(self.cumulative_sold, 4),
-            "exploration_rate": round(self.exploration_rate, 4),
-            "soc_avg": round(float(soc_avg), 4),
-            "soc_min": round(float(soc_min), 4),
-            "soc_max": round(float(soc_max), 4),
+            "cumulative_reward": round(float(self.cumulative_reward), 4),
+            "actual_profit_eur": round(float(self.cumulative_profit), 4),
+            "energy_bought_kwh": round(float(self.cumulative_bought), 4),
+            "energy_sold_kwh": round(float(self.cumulative_sold), 4),
+            "soc_avg": round(float(np.mean(soc_arr)), 4),
+            "soc_min": round(float(np.min(soc_arr)), 4),
+            "soc_max": round(float(np.max(soc_arr)), 4),
             "trade_count_buy": self.trade_count_buy,
             "trade_count_sell": self.trade_count_sell,
             "avg_buy_price": round(avg_buy_price, 4),
             "avg_sell_price": round(avg_sell_price, 4),
-            "avg_return": round(self.last_avg_return, 4),
-            "return_std": round(self.last_return_std, 4),
+            "alpha": round(float(self.learner.alpha.item()), 6),
+            "critic_loss": round(float(d.get("critic_loss", 0.0)), 6),
+            "entropy": round(float(d.get("entropy", 0.0)), 6),
+            "buffer_size": int(len(self.learner.buffer)),
+            "total_updates": int(self.learner.total_updates),
         }
-        with open("output/mc/episode_logs.jsonl", "a") as f:
+        with open("output/sac/episode_logs.jsonl", "a") as f:
             f.write(json.dumps(record) + "\n")
 
     def _reset_episode_counters(self):
-        self.cumulative_reward = 0
-        self.cumulative_profit = 0
-        self.cumulative_bought = 0
-        self.cumulative_sold = 0
+        self.episode_profits.append(self.cumulative_profit)
+        self.cumulative_reward = 0.0
+        self.cumulative_profit = 0.0
+        self.cumulative_bought = 0.0
+        self.cumulative_sold = 0.0
         self.trade_count_buy = 0
         self.trade_count_sell = 0
         self.buy_price_sum = 0.0
@@ -1039,14 +864,23 @@ class storage(mesa.Agent):
             
             elif self.method == "learning":
                 state = self.build_state()
-                action, hidden = self.policy(state)
-                
-                # Store for learning
+                action = self.learner.select_action(state, deterministic=False)
+
+                # Hard safety overrides (emergencies only; excluded from replay)
+                override = False
+                if self.soc < 0.10:
+                    action = 1.0
+                    override = True
+                elif self.soc > 0.95:
+                    action = -1.0
+                    override = True
+
                 self.last_state = state
                 self.last_action = action
-                self.last_hidden = hidden
-                
-                # Convert action to market bid/ask
+                self.last_decision_price = self.get_current_price()
+                self.last_soc = self.soc
+                self.last_override_active = override
+
                 self.action_to_bid(action)
         
         else:  # Non-LEC participation

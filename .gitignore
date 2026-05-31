@@ -5,6 +5,9 @@
 # Simulation output
 output/
 
+# Local documentation
+docs/
+
 # Ignore the contents of data/config, but not the folder itself
 data/config/*
 # Now allow the specific files

@@ -476,8 +476,8 @@ class storage(mesa.Agent):
             self.target_critic_theta = {k: v.copy() for k, v in self.critic_theta.items()}
             self.target_update_tau = 0.005   # Polyak averaging coefficient
             
-            self.actor_lr = 0.03       # Policy learning rate
-            self.critic_lr = 0.05      # Value function learning rate
+            self.actor_lr = 0.008      # Policy learning rate
+            self.critic_lr = 0.015     # Value function learning rate
             self.gamma = 0.98          # Discount factor
             self.trajectory = []       # On-policy buffer; cleared after each update
             
@@ -487,6 +487,7 @@ class storage(mesa.Agent):
             self.last_raw_action = None   # raw tanh(z) before bias/noise — used for gradients
             self.last_hidden = None       # post-activation h1 (shape: n_hidden)
             self.last_h1_in = None        # pre-activation h1_in — needed for LeakyReLU derivative
+            self.last_override_active = False  # True when hard safety override fired this step
             self.episode_profits = []
             self.cumulative_reward = 0
             self.cumulative_profit = 0
@@ -509,7 +510,7 @@ class storage(mesa.Agent):
             self.soc_history = deque(maxlen=2000)
             
             # SOC operating range
-            self.soc_floor = 0.10
+            self.soc_floor = 0.20
             self.soc_ceiling = 0.85
             self.soc_target = 0.50
             
@@ -886,6 +887,7 @@ class storage(mesa.Agent):
                 self.cumulative_profit -= actual_cost
 
                 reward = self.compute_reward(bought, sold, price)
+                reward = float(np.clip(reward, -5.0, 5.0))
                 self.cumulative_reward += reward
 
                 if bought > 0.01:
@@ -897,16 +899,17 @@ class storage(mesa.Agent):
 
                 next_state = self.build_state()
 
-                self.trajectory.append((
-                    self.last_state,
-                    self.last_action,
-                    self.last_raw_action,   # raw tanh(z) — used for correct gradient computation
-                    reward,
-                    next_state,
-                    self.last_hidden,       # post-activation h1 (ndarray)
-                    self.last_h1_in,        # pre-activation h1_in — needed for LeakyReLU derivative
-                    self.soc,
-                ))
+                if not self.last_override_active:
+                    self.trajectory.append((
+                        self.last_state,
+                        self.last_action,
+                        self.last_raw_action,   # raw tanh(z) — used for correct gradient computation
+                        reward,
+                        next_state,
+                        self.last_hidden,       # post-activation h1 (ndarray)
+                        self.last_h1_in,        # pre-activation h1_in — needed for LeakyReLU derivative
+                        self.soc,
+                    ))
 
                 self.last_state = next_state
 
@@ -1109,7 +1112,7 @@ class storage(mesa.Agent):
             recent = np.mean(self.episode_profits[-2:])
             older  = np.mean(self.episode_profits[-4:-2])
             actor_lr *= 1.1 if recent > older else 0.9
-            actor_lr = float(np.clip(actor_lr, 0.01, 0.08))
+            actor_lr = float(np.clip(actor_lr, 0.003, 0.015))
 
         self.theta["W1"] += actor_lr * np.clip(grad_W1 / n, -max_grad, max_grad)
         self.theta["b1"] += actor_lr * np.clip(grad_b1 / n, -max_grad, max_grad)
@@ -1194,6 +1197,7 @@ class storage(mesa.Agent):
             elif self.method == "learning":
                 # RL-based bidding
                 state = self.build_state()
+                self.last_override_active = (state[0] < 0.10 or state[0] > 0.95)
                 action, raw_action, hidden, h1_in = self.policy(state)
 
                 # Exploration noise applied to action only — raw_action stays clean for gradients

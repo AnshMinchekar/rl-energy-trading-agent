@@ -1,4 +1,9 @@
-# Reinforcement Learning Storage Agent
+# Reinforcement Learning Storage Agent — Soft Actor-Critic (SAC)
+
+> **Branch:** `algo/soft-actor-critic`. Each `algo/*` branch implements a
+> different RL algorithm in `mesa_model/agents.py` (class `storage`) while the
+> rest of the simulation is unchanged. This branch uses **Soft Actor-Critic**,
+> implemented with PyTorch in `mesa_model/sac.py`.
 
 ### The Goal
 
@@ -8,369 +13,283 @@
 Buy Low  →  Store  →  Sell High  →  Profit
 ```
 
+The agent must learn to *buy low and sell high* — not simply discharge its
+starting energy. The reward (Section 5) is designed so that holding charge into
+a rising price is rewarded and draining the battery is not.
+
+---
+
 ## 1. Architecture
+
+SAC is an **off-policy, maximum-entropy actor-critic**. Three things make it a
+good fit for battery arbitrage:
+
+- **Off-policy replay** — every transition (especially rare price spikes/troughs,
+  the highest-value events) is stored and reused many times.
+- **Twin critics** — two Q-networks and a `min` target prevent value
+  overestimation, which would otherwise inflate the apparent value of selling.
+- **Automatic entropy temperature** — exploration is a principled, self-tuning
+  objective, not a hand-scheduled noise that decays before convergence.
 
 ### Data Flow
 
 ```
-Market Data → State Builder → Neural Network → Action → Market Bid/Ask
-                                   ↓
-                            Experience Memory
-                                   ↓
-                            Policy Gradient Update
-                                   ↓
-                            Updated Weights
+                          ┌──────────────────────────────────────┐
+                          │            Replay Buffer             │
+                          │     (s, a, r, s′) × up to 100k        │
+                          └──────────────────────────────────────┘
+                              ▲ push                  │ sample 256
+   Market price/SOC           │                       ▼
+        │              ┌──────────────┐      ┌───────────────────────────┐
+        ▼              │  update_     │      │  SAC update × 4 / step    │
+  build_state (16-D) → │  status()    │      │  • twin critics (min)     │
+        │              │  mark-to-    │      │  • actor (reparam.)       │
+        ▼              │  market      │      │  • entropy temp α         │
+   actor.select_action │  reward      │      │  • Polyak target update   │
+        │              └──────────────┘      └───────────────────────────┘
+        ▼
+  fixed-spread bid/ask → market clears → realised bought/sold
 ```
+
+Acting happens in `storage.step()`; learning happens in `storage.update_status()`
+**every timestep** (4 gradient updates per step — see Section 6).
 
 ---
 
 ## 2. State Representation
 
-The agent creates a **9-dimensional state vector**:
+The agent builds a **16-dimensional state vector** (`storage.build_state`). All
+price-derived features come from rolling buffers of *observed* prices only —
+there is **no future-price leakage**.
 
 ```python
-state = [soc, max_discharge, max_charge, price_norm, 
-         price_diff_1h, price_diff_4h, hour_norm, dow_norm, price_percentile]
+state = [soc, headroom_to_ceiling, headroom_to_floor,
+         price_norm, price_percentile, price_vs_hourly_baseline,
+         price_momentum_1h, price_momentum_4h, price_vol_24h, spread_norm,
+         sin_hour, cos_hour, sin_dow, cos_dow, sin_month, cos_month]
 ```
 
-### State Features Explained
+| Idx | Feature | Description |
+|-----|---------|-------------|
+| 0 | `soc` | Battery charge level [0, 1] |
+| 1 | `headroom_to_ceiling` | Room left to charge: `(ceiling − soc)/(ceiling − floor)` |
+| 2 | `headroom_to_floor` | Room left to discharge: `(soc − floor)/(ceiling − floor)` |
+| 3 | `price_norm` | `(price − mean₂₄ₕ)/std₂₄ₕ` — cheap/expensive right now |
+| 4 | `price_percentile` | Fraction of the last 96 observed prices below the current one |
+| 5 | `price_vs_hourly_baseline` | Price vs a **causal** EWMA of price *for this hour of day* |
+| 6 | `price_momentum_1h` | `price / price₁ₕ_ago − 1` |
+| 7 | `price_momentum_4h` | `price / price₄ₕ_ago − 1` |
+| 8 | `price_vol_24h` | `std₂₄ₕ / mean₂₄ₕ` — is arbitrage worth it now? |
+| 9 | `spread_norm` | External-grid buy/sell spread — opportunity cost of trading |
+| 10–11 | `sin/cos_hour` | Time of day (cyclic) |
+| 12–13 | `sin/cos_dow` | Day of week (cyclic) |
+| 14–15 | `sin/cos_month` | Season (cyclic) |
 
-| Index | Feature | Range | Description |
-|-------|---------|-------|-------------|
-| 0 | `soc` | [0, 1] | Current battery charge level |
-| 1 | `max_discharge` | [0, P_max] | Maximum power available to sell |
-| 2 | `max_charge` | [0, P_max] | Maximum power available to buy |
-| 3 | `price_norm` | ~[-1, 1] | Current price relative to 24h average |
-| 4 | `price_diff_1h` | ~[-1, 1] | Expected price change in 1 hour |
-| 5 | `price_diff_4h` | ~[-1, 1] | Expected price change in 4 hours |
-| 6 | `hour_norm` | [0, 1] | Hour of day |
-| 7 | `dow_norm` | [0, 1] | Day of week |
-| 8 | `price_percentile` | [0, 1] | Price percentile in last 24 hours |
-
-### Example State Interpretation
-
-```python
-state = [0.45, 0.37, 0.37, -0.25, +0.15, +0.40, 0.25, 0.33, 0.12]
-```
-
-**Breakdown:**
-- Battery is 45% full 
-- Can charge or discharge at 37 kW
-- Current price is 25% below average 
-- Price rising 15% in 1 hour, 40% in 4 hours
-- It's 6 AM on Wednesday
-- Price is in bottom 12% of last 24 hours
-
-**Optimal decision:** To buy. (Since the prices are low but rising)
+**The hourly baseline (idx 5) is the key arbitrage feature.** A causal EWMA keyed
+by hour-of-day tells the agent whether the current price is unusually cheap or
+dear *for this time of day*, so it can charge ahead of the predictable evening
+peak — using only prices it has already observed.
 
 ---
 
-## 3. Neural Network Policy
+## 3. Networks
 
-### Architecture
-
-The policy is a simple **2-layer neural network**:
+### Actor — squashed Gaussian policy
 
 ```
-Input (9 features)
-       │
-       ▼
-┌─────────────────────┐
-│  Hidden Layer       │
-│  - Weighted sum     │
-│  - LeakyReLU        │
-│  - 1 neuron         │
-└─────────────────────┘
-       │
-       ▼
-┌─────────────────────┐
-│  Output Layer       │
-│  - Weighted sum     │
-│  - Tanh activation  │
-│  - 1 neuron         │
-└─────────────────────┘
-       │
-       ▼
-Action ∈ [-1, +1]
+state(16) → Linear(16→64) → LayerNorm → ReLU
+          → Linear(64→64) → LayerNorm → ReLU
+          → Linear(64→2)   →  (μ, log σ)
+
+u      = μ + σ · ε ,   ε ~ N(0, 1)        # reparameterised sample
+action = tanh(u) ∈ (−1, +1)               # +1 = max charge, −1 = max discharge
+log π  = log N(u; μ, σ) − Σ log(1 − tanh(u)² + 1e-6)   # tanh correction
 ```
 
+The reparameterisation trick makes the entropy term differentiable. At
+evaluation, the deterministic mean `tanh(μ)` is used.
 
+### Twin critics — Q(s, a)
 
-**Layer 1 (Hidden):**
-```
-h1_input = soc_w × (soc - target) + price_w × price_norm + ... + bias₁
-
-h1 = LeakyReLU(h1_input)
-
-Here, if h1_input > 0
-  h1 = h1_input 
-
-  or else, 
-  h1 = 0.1 × h1_input 
-```
-
-- `target` = SOC target centre point (0.50) — the agent is nudged to keep the battery half-full
-- `bias₁` = learned bias term for the hidden layer
-
-**Layer 2 (Output):**
-```
-z = hidden_w × h1 + bias₂
-
-action = tanh(z) ∈ [-1, +1]
-```
-
-- `z` = pre-activation value (weighted sum before tanh is applied)
-- `bias₂` = learned bias term for the output layer
-
-### Why These Activations?
-
-| Activation | Location | Purpose |
-|------------|----------|---------|
-| **LeakyReLU** | Hidden layer | Prevents "dead neurons" during exploration, basically keeping the weights updated |
-| **Tanh** | Output layer | Bounds action to [-1, +1] range |
-
-### Network Weights
-
-```python
-theta = {
-    "layer1": {
-        "soc_w": -3.0,        # High SOC → sell (negative action)
-        "price_w": -1.2,      # High price → sell
-        "price_diff_w": 0.8,  
-        "forecast_1h_w": 0.5,
-        "forecast_4h_w": 0.5,
-        "time_w": 0.2,
-        "dow_w": 0.0,
-        "bias": 0.0
-    },
-    "layer2": {
-        "hidden_w": 1.5,
-        "bias": 0.0
-    }
-}
-```
-
-**Intuition behind `soc_w = -3.0`:**
-- When SOC is above target: `(soc - target) > 0`
-- Multiplied by negative weight: `-3.0 × positive = negative`
-- Negative hidden value → negative action → **SELL**
-
----
-
-## 4. Action Space
-
-### Continuous Action
-
-The neural network outputs a single continuous value:
+Two independent networks `(state ⊕ action) ∈ ℝ¹⁷ → 64 → 64 → 1`, each with a
+slow-moving **target** copy. The bootstrap target takes the **minimum** of the
+two target critics to curb overestimation:
 
 ```
-action ∈ [-1, +1]
-```
-
-| Action Value | Meaning | Market Behavior |
-|--------------|---------|-----------------|
-| +1.0 | Maximum charge | Buy at high price |
-| +0.5 | Moderate charge | Buy at reasonable price |
-| 0.0 | Hold | No trading |
-| -0.5 | Moderate discharge | Sell at reasonable price |
-| -1.0 | Maximum discharge | Sell at low price |
-
-### Action to Market Bid/Ask
-
-The continuous action is converted to market orders:
-
-```python
-if action > 0:  # Positive = Buy
-    power = action × max_charge
-    bid_price = current_price × (1 + 0.5 × action) + premium
-    
-if action < 0:  # Negative = Sell
-    power = |action| × max_discharge
-    ask_price = current_price × (0.8 + 0.4 × (1 + action))
-```
-
-### Safety Overrides
-
-The policy includes hard limits to prevent the storage from completely depleting:
-
-```python
-# Emergency conditions (override neural network)
-if soc < 0.10:  action = +1.0   # Must charge!
-if soc > 0.95:  action = -1.0   # Must discharge!
-
-# Price-based nudges (applied after NN output)
-if price_percentile < 0.15 and soc < 0.60:  action += 0.25  # Cheap price → nudge to buy
-if price_percentile > 0.85 and soc > 0.35:  action -= 0.25  # Expensive price → nudge to sell
+a′, log π′ = actor(s′)
+y = r + γ · ( min(Q1_target(s′, a′), Q2_target(s′, a′)) − α · log π′ )
 ```
 
 ---
 
-## 5. Reward Function
+## 4. Action → Market Bid/Ask
 
-The reward signal guides learning. Our reward has three components:
-
-### 5.1 Profit Reward (Primary)
-
-```python
-energy_cost = price × (bought - sold) / 100  # in €
-profit_reward = -energy_cost × 5.0
-```
-
-| Transaction | Energy Cost | Profit Reward |
-|-------------|-------------|---------------|
-| Buy 10 kWh @ 5ct | +€0.50 | -€2.50 |
-| Sell 10 kWh @ 8ct | -€0.80 | +€4.00 |
-
-**Note:** Negative cost = profit = positive reward
-
-### 5.2 SOC Penalty (Safety)
+The action maps directly to power with a **fixed small spread** — the agent
+learns *when* and *how much* to trade, not how to shade prices
+(`storage.action_to_bid`):
 
 ```python
-if soc < 0.10:       penalty = -100.0   # Critical!
-elif soc < 0.20:     penalty = -30.0 × (0.20 - soc) / 0.10
-elif soc > 0.90:     penalty = -30.0 × (soc - 0.90) / 0.10
-elif soc > 0.80:     penalty = -10.0 × (soc - 0.80) / 0.10
-else:                penalty = 0.0      # Safe zone
+spread = 0.2  # ct/kWh, just enough to clear vs the external-grid margin
+
+if action > 0:   # charge
+    power     = action × max_charge
+    bid_price = price_now + spread
+elif action < 0: # discharge
+    power     = |action| × max_discharge
+    ask_price = max(price_now − spread, 0.01)
 ```
 
-### 5.3 Arbitrage Bonus (Timing)
+Filled volumes are read back from the market clearing, so the reward always uses
+*actually traded* energy, not the requested amount.
+
+### Safety overrides
 
 ```python
-# Reward buying cheap
-if bought > 0 and price < avg_price × 0.80:
-    bonus += 3.0  # Good buy!
-
-# Reward selling expensive  
-if sold > 0 and price > avg_price × 1.20:
-    bonus += 3.0  # Good sell!
+if soc < 0.10:  action = +1.0   # emergency charge (aggressive bid to guarantee fill)
+if soc > 0.95:  action = -1.0   # emergency discharge
 ```
 
-### Total Reward
-
-```python
-reward = profit_reward + soc_penalty + arbitrage_bonus + soc_center_bonus
-```
+The soft operating band (`floor 0.20`, `ceiling 0.85`) is **not** hard-enforced —
+the policy learns to respect it because leaving it forfeits future profit. The
+overrides are physical safety only. Override transitions are still stored in
+replay so the critic learns that hitting the floor triggers a costly recharge.
 
 ---
 
-## 6. Learning Algorithm
+## 5. Reward — Mark-to-Market Wealth Change
 
-### Monte Carlo Policy Gradient (REINFORCE)
-
-The agent uses **Monte Carlo Policy Gradient** — it collects a full episode of experience (96 timesteps = 1 day) before updating its weights, using the actual realized returns from that trajectory.
-
-### Episode Cycle
-
-Each timestep during an episode:
+This is the heart of the design. A naive per-step cash-flow reward
+(`(sold − bought)·price`) makes every sale an instant gain and every purchase an
+instant loss, so the agent learns to drain the battery and sit empty. We instead
+reward the change in **total economic wealth = cash + value of stored energy**
+(`storage.compute_reward`):
 
 ```python
-# 1. Act
-state = build_state()
-action, hidden = policy(state)          # forward pass through NN
+cashflow        = (sold − bought) · p_decision / 100                    # €
+inventory_delta = (p_now · soc_new − p_decision · soc_old) · capacity / 100   # €
+reward          = cashflow + inventory_delta
+```
+
+- `p_decision` — the price the agent saw when it acted (the settlement price)
+- `p_now` — the price now observed, one step later
+
+Both are observed prices, so there is no future leakage.
+
+**Why this fixes the draining trap:**
+
+| Situation | Reward | Effect |
+|-----------|--------|--------|
+| Buy `E` at price `p` | ≈ 0 (cash out balanced by inventory gained) | buying is **not** punished |
+| Hold charge while price rises `p → p′` | `+E·(p′−p)/100` | **rewarded for being charged into a peak** |
+| Sell at a high price | realises the gain already credited | no double counting |
+| Sell at a low price / churn | slightly negative (efficiency loss) | discourages pointless cycling |
+
+`reward = cashflow + (Φ_t − Φ_{t−1})` where `Φ = price·soc·capacity/100` is a
+state potential, so this is **potential-based reward shaping** — it densifies the
+learning signal without changing the optimal policy. A small `−0.5` penalty is
+added only at the hard SOC limits (`<0.05` or `>0.97`).
+
+Rewards are scaled by `reward_scale = 10` before learning so the tiny per-step
+euro amounts are not swamped by the entropy term.
+
+---
+
+## 6. Learning Algorithm — SAC
+
+Unlike Monte Carlo or on-policy TD, SAC learns **off-policy from a replay buffer
+every timestep**, reusing past experience many times.
+
+### Per-timestep cycle
+
+```python
+# storage.step()  — act at time τ
+state  = build_state()
+action = learner.select_action(state)        # random during warm-up, else actor sample
 place_market_bid_or_ask(action)
 
-# 2. Observe outcome (after market clears)
-reward = compute_reward(bought, sold, price)
-episode_buffer.append((state, action, reward, hidden))
+# storage.update_status()  — at time τ+1, after the market clears
+reward     = compute_reward(bought, sold, p_decision, p_now, soc_old, soc_new)
+next_state = build_state()
+learner.push(state, action, reward, next_state)   # → replay buffer
+learner.learn()                                   # 4 gradient updates (see below)
 ```
 
-After 96 steps, the MC update runs and the buffer is cleared.
+### The SAC updates (`SACLearner.update`, run 4× per step)
 
-### Return Computation
+```python
+# 1. Critic: regress both Q-nets onto the min-target Bellman backup
+y          = r + γ · (min(Q1ᵗ(s′,a′), Q2ᵗ(s′,a′)) − α · log π(a′|s′))
+critic_loss = MSE(Q1(s,a), y) + MSE(Q2(s,a), y)
 
-True discounted returns are computed **backwards** through the episode buffer:
+# 2. Actor (every 2nd update): maximise Q while staying stochastic
+actor_loss = E[ α · log π(a|s) − min(Q1(s,a), Q2(s,a)) ]      # a reparameterised
 
-```
-G = 0
-for each step t (reversed):
-    G = rₜ + γ × G
-    returns.prepend(G)
+# 3. Temperature α: drive entropy toward the target
+alpha_loss = −E[ α · (log π(a|s) + target_entropy) ]          # target_entropy = −1
+
+# 4. Polyak update of the target critics
+θ_target ← (1 − τ)·θ_target + τ·θ
 ```
 
 **Symbol definitions:**
 
 | Symbol | Meaning |
 |--------|---------|
-| `G` | Discounted cumulative return — the total reward from step t to end of episode |
-| `rₜ` | Reward received at timestep t |
-| `γ` (gamma) | Discount factor (0.98) — how much future rewards are worth relative to immediate ones. γ=0.98 means a reward 1 step away is worth 98% of an immediate reward |
-| `t` | Current timestep index within the episode (0 to 95) |
-| `reversed` | We iterate from the last step backwards so each G accumulates future rewards correctly |
+| `γ` | Discount factor (0.99 → ≈25 h horizon, spans the daily price cycle) |
+| `α` | Entropy temperature — auto-tuned so policy entropy ≈ `target_entropy` |
+| `log π(a\|s)` | Log-probability of the action under the current policy |
+| `Q1, Q2` | The twin critics; `Q1ᵗ, Q2ᵗ` their slow target copies |
+| `τ` | Polyak averaging coefficient (0.005) for target updates |
+| `min(Q1,Q2)` | Clipped double-Q — curbs value overestimation |
 
-This gives each step its true long-run return — unlike TD methods which bootstrap from a value estimate. Returns are then **normalized** (zero mean, unit std) to reduce gradient variance.
+### Update-to-data ratio (UTD)
 
-### Weight Update (Policy Gradient Backprop)
+The gurobi market solve (~2.25 s/step) dominates wall-clock, so SAC's tiny
+networks are nearly free to update. We therefore run **4 gradient updates per
+environment step** (`updates_per_step = 4`), extracting ~4× the learning from the
+same simulation — the single most effective knob for sample efficiency here.
 
-Gradients are computed manually through the 2-layer network:
+### Warm-up
 
-```python
-# Output layer gradient
-grad_output = advantage × (1 - action²)   # derivative of tanh
-
-# Hidden layer gradient (backprop through LeakyReLU)
-grad_hidden = grad_output × hidden_w × leaky_relu_deriv
-
-# Accumulate over all steps in the episode, then apply:
-weight += lr × clip(grad / n, -0.3, +0.3)
-```
-
-**Symbol definitions:**
-
-| Symbol | Meaning |
-|--------|---------|
-| `advantage` | The normalized return `G_t` for that step — how much better/worse this outcome was than average |
-| `G_t` | Normalized discounted return at step t |
-| `n` | Total number of steps in the episode (96) — used to average gradients |
-| `lr` | Learning rate (~0.008, adaptive) |
-| `action²` | Squared action value — appears in the tanh derivative: d/dx tanh(x) = 1 - tanh²(x) |
-| `leaky_relu_deriv` | 1.0 if hidden unit h1 > 0, else 0.1 |
-| `clip(·, -0.3, +0.3)` | Gradient clipping — prevents any single update from being too large |
-
-### Adaptive Learning Rate
-
-```python
-if recent_profits > older_profits:
-    lr *= 1.05  # Working → speed up
-else:
-    lr *= 0.95  # Struggling → slow down
-
-lr = clip(lr, 0.001, 0.015)
-```
-
-### Experience Memory
-
-Each timestep also stores a transition to a replay buffer (capacity 15,000):
-
-```python
-memory.append((state, action, reward, next_state, hidden, soc))
-```
-
-The MC weight update uses the `episode_buffer`, not this replay memory.
+The first **500** steps use a uniform-random policy to seed the replay buffer
+before any gradient update, so learning starts from a diverse batch.
 
 ---
 
 ## 7. Hyperparameters
 
-### Learning Parameters
-
-Applied directly to the weights.
-
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `learning_rate` | 0.008 | Step size for weight updates |
-| `gamma` | 0.98 | Discount factor for computing G_t = r + γ·G |
-| `batch_size` | 64 | Samples per update |
-| `memory_size` | 15,000 | Maximum stored transitions |
-| `update_frequency` | 96 | Timesteps between updates (1 day) |
-
-### Exploration Parameters
-
-Applied to the "buy/sell action"
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `exploration_rate` | 0.35 | Initial noise level |
-| `exploration_decay` | 0.997 | Decay per episode |
-| `min_exploration` | 0.08 | Minimum noise level |
+| `state_dim` | 16 | State vector dimension |
+| hidden width | 64 | Per layer, actor and critics |
+| `gamma` | 0.99 | Discount (~25 h horizon) |
+| `actor_lr` / `critic_lr` / `alpha_lr` | 3e-4 | Adam learning rates |
+| `tau` | 0.005 | Polyak target-update coefficient |
+| `target_entropy` | −1.0 | Entropy target for a scalar action |
+| `buffer_size` | 100,000 | Replay capacity |
+| `batch_size` | 256 | Minibatch per gradient update |
+| `warmup_steps` | 500 | Random-policy steps before learning |
+| `updates_per_step` | 4 | Gradient updates per environment step (UTD) |
+| `actor_update_every` | 2 | Actor + α updated every other gradient step |
+| `reward_scale` | 10.0 | Scales the per-step € reward |
+| `soc_floor` / `soc_ceiling` | 0.20 / 0.85 | Soft band (policy-enforced) |
 
 ---
+
+## 8. Running
+
+```bash
+conda activate Diss_clean
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # one-time: SAC dependency
+python main.py
+```
+
+Per-episode metrics (profit, captured spread, SOC band, α, entropy, critic loss)
+are written to `output/sac/episode_logs.jsonl`. Run
+`python analysis/analyze_sac.py` to produce learning-curve plots and a summary
+table comparing SAC against the MC and TD branches.
+
+> **Dependency note:** this branch requires **PyTorch** (CPU build is sufficient),
+> which the MC/TD branches do not. SAC also sets `KMP_DUPLICATE_LIB_OK=TRUE` and
+> pins torch to a single thread so its OpenMP runtime coexists with gurobi/MKL on
+> Windows.

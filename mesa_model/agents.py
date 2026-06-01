@@ -456,6 +456,8 @@ class storage(mesa.Agent):
             batch_size=256,
             warmup_steps=500,     # sim is ~8.5k steps total; keep warm-up a small fraction
             actor_update_every=2,
+            updates_per_step=4,   # UTD ratio: sim (not SAC) is the bottleneck, so extra
+                                  # gradient updates per step are nearly free and 4× the learning
             reward_scale=self.reward_scale,
             seed=42,
         )
@@ -731,11 +733,14 @@ class storage(mesa.Agent):
 
             next_state = self.build_state()
 
-            # Forced-override steps are not policy decisions → keep them out of replay
-            if not self.last_override_active:
-                self.learner.push(self.last_state, self.last_action, reward, next_state, 0.0)
+            # Push every transition, including forced-override steps. SAC's actor
+            # re-samples its own actions, so it is never trained toward the forced
+            # action; the critic, however, learns from (s, forced_a, r, s') that
+            # draining to the floor triggers a costly recharge — the exact signal
+            # that teaches the agent low SOC is bad. Excluding them hid that cost.
+            self.learner.push(self.last_state, self.last_action, reward, next_state, 0.0)
 
-            diag = self.learner.update()
+            diag = self.learner.learn()
             if diag:
                 # merge so actor-only fields (entropy) persist across critic-only steps
                 self.last_diagnostics.update(diag)

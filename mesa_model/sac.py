@@ -148,7 +148,8 @@ class SACLearner:
     def __init__(self, state_dim, action_dim=1, hidden=64,
                  gamma=0.99, tau=0.005, lr=3e-4, target_entropy=-1.0,
                  buffer_size=100_000, batch_size=256, warmup_steps=2_000,
-                 actor_update_every=2, reward_scale=10.0, seed=42, device="cpu"):
+                 actor_update_every=2, updates_per_step=1,
+                 reward_scale=10.0, seed=42, device="cpu"):
         torch.manual_seed(seed)
         self.device = torch.device(device)
         self.gamma = gamma
@@ -156,6 +157,7 @@ class SACLearner:
         self.batch_size = batch_size
         self.warmup_steps = warmup_steps
         self.actor_update_every = actor_update_every
+        self.updates_per_step = updates_per_step   # gradient updates per env step (UTD ratio)
         self.reward_scale = reward_scale
         self.target_entropy = target_entropy
         self.action_dim = action_dim
@@ -213,6 +215,16 @@ class SACLearner:
         self.total_env_steps += 1
 
     # -- learning -----------------------------------------------------------
+    def learn(self):
+        """Run ``updates_per_step`` gradient updates (UTD ratio). Returns the
+        most recent non-None diagnostics."""
+        diag = None
+        for _ in range(self.updates_per_step):
+            d = self.update()
+            if d is not None:
+                diag = d
+        return diag
+
     def update(self):
         if len(self.buffer) < max(self.batch_size, self.warmup_steps):
             return None

@@ -206,11 +206,11 @@ class LEM(mesa.Model):
         self.grid.storage["id"]="None"
         for a in range (0,len(self.grid.storage)):
             if self.grid.storage.loc[a]["bus"]!=4:
-                storage(self, self.grid.storage.loc[a]["max_e_mwh"]*1000, self.grid.storage.loc[a]["p_mw"]*-1000, self.grid.storage.loc[a]["bus"],self.grid.storage.loc[a]["efficiency_percent"], 1-self.grid.storage.loc[a]["self-discharge_percent_per_day"], "optimisation")
+                storage(self, self.grid.storage.loc[a]["max_e_mwh"]*1000, self.grid.storage.loc[a]["p_mw"]*-1000, self.grid.storage.loc[a]["bus"],self.grid.storage.loc[a]["efficiency_percent"], 1-self.grid.storage.loc[a]["self-discharge_percent_per_day"]/100, "optimisation")
             self.grid.storage.loc[a]["id"]=id_count
             id_count+=1
         a=0
-        storage(self, self.grid.storage.loc[a]["max_e_mwh"]*1000, self.grid.storage.loc[a]["p_mw"]*-1000, 5,self.grid.storage.loc[a]["efficiency_percent"], 1-self.grid.storage.loc[a]["self-discharge_percent_per_day"], "learning")
+        storage(self, self.grid.storage.loc[a]["max_e_mwh"]*1000, self.grid.storage.loc[a]["p_mw"]*-1000, 5,self.grid.storage.loc[a]["efficiency_percent"], 1-self.grid.storage.loc[a]["self-discharge_percent_per_day"]/100, "learning")
         
         for aa in self.grid.load.index:
                 profile_str = self.grid.load.at[aa,"profile"]
@@ -266,7 +266,7 @@ class LEM(mesa.Model):
         self.market_price_margin_sell=0.3
         self.market_price_margin_charge=[agents.margin_charge for agents in self.agents if agents.flex==2][0]
         self.HEM_dict=self.build_HEM_dict()
-        self.solver="gurobi"
+        self.solver="gurobi_direct"
 
 
 

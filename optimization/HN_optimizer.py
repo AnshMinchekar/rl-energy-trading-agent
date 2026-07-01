@@ -80,8 +80,10 @@ class HNOptimizer:
         """Configure solver options in a solver-agnostic way"""
         solver_name = solver_name.lower()
         
-        if solver_name == 'gurobi':
+        if solver_name in ['gurobi', 'gurobi_direct', 'gurobi_persistent']:
             # Gurobi options - optimized for fast feasible solutions
+            # (gurobi_direct/_persistent run in-process via gurobipy but accept
+            #  the same native parameter names as the legacy shell interface)
             self.solver.options['TimeLimit'] = time_limit
             self.solver.options['MIPGap'] = mip_gap
             self.solver.options['MIPFocus'] = 1  # 1=feasibility, 2=optimality, 3=bound
@@ -119,7 +121,14 @@ class HNOptimizer:
             # GLPK (open-source, limited options)
             self.solver.options['tmlim'] = time_limit
             self.solver.options['mipgap'] = mip_gap
-            
+
+        elif solver_name == 'appsi_highs':
+            # HiGHS (open-source) via APPSI interface
+            self.solver.options['time_limit'] = time_limit
+            self.solver.options['mip_rel_gap'] = mip_gap
+            self.solver.options['threads'] = threads
+            self.solver.options['output_flag'] = False
+
         else:
             # Generic options (may not work for all solvers)
             print(f"Warning: Solver '{solver_name}' not specifically configured. Using generic options.")

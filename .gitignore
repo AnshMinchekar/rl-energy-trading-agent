@@ -15,10 +15,12 @@ data/config/*
 
 # Ignore everything else in scenario_data
 data/scenario_data/
+docs/
+output/
 
 # Python Caches
 **/__pycache__/
 *.py[cod]
-
+*.csv
 # Secrets
 gurobi.lic

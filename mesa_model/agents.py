@@ -19,6 +19,7 @@ import warnings
 warnings.simplefilter("ignore", category=FutureWarning)
 import gc
 from mesa_model.sac import SACLearner
+from mesa_model.storage_logic import state_features, mark_to_market_reward
 
 def initialize(self, typ, factor, cosphi, bus):
     self.typ=typ
@@ -459,8 +460,29 @@ class storage(mesa.Agent):
             updates_per_step=4,   # UTD ratio: sim (not SAC) is the bottleneck, so extra
                                   # gradient updates per step are nearly free and 4× the learning
             reward_scale=self.reward_scale,
+            alpha_min=0.05,       # floor on entropy temperature — keeps exploration
+                                  # alive (auto-α otherwise collapses to ~0 prematurely)
             seed=42,
         )
+
+        # Annealed SOC-band shaping. A soft pull toward the operating band that
+        # decays to zero over training, so it guides the policy out of the
+        # drain/hoard corners early but leaves the *final* policy unbiased
+        # (potential-based inventory term remains the only persistent shaping).
+        self.soc_shaping_weight = 1.0
+        self.soc_shaping_anneal = 100_000.0   # env steps over which it fades to 0
+        self.current_epoch = 0                # set by the multi-epoch loop in main.py
+
+        # Optional: load a policy pre-trained on the surrogate env, and/or run
+        # frozen (deterministic, no further learning) for evaluation in the
+        # full market. See train_surrogate.py.
+        import os
+        self.eval_mode = os.environ.get("SAC_EVAL", "0") == "1"
+        _load_path = os.environ.get("SAC_LOAD_POLICY")
+        if _load_path and os.path.exists(_load_path):
+            self.learner.load(_load_path)
+            print(f"[Storage] Loaded SAC policy from {_load_path} "
+                  f"(eval_mode={self.eval_mode})", flush=True)
 
         # Transition assembly across step() → update_status()
         self.last_state = None
@@ -549,51 +571,16 @@ class storage(mesa.Agent):
         All price-derived features use only the rolling observed-price buffers
         populated in update_status — no future data is read.
         """
-        eps = 1e-6
-
-        def clip(x, lo=-5.0, hi=5.0):
-            return float(np.clip(x, lo, hi))
-
-        p = self.get_current_price()
-        hist = (np.asarray(self.price_history, dtype=float)
-                if len(self.price_history) > 0 else np.array([p], dtype=float))
-        mean = float(hist.mean())
-        std = float(hist.std())
-
-        soc = float(self.soc)
-        span = (self.soc_ceiling - self.soc_floor) + eps
-        headroom_ceiling = clip((self.soc_ceiling - soc) / span)
-        headroom_floor = clip((soc - self.soc_floor) / span)
-
-        price_norm = clip((p - mean) / (std + eps)) if std > eps else 0.0
-        percentile = float(np.mean(hist < p)) if len(hist) > 1 else 0.5
-
-        base_h = self.hourly_price_ewma.get(self.model.current_date.hour, mean)
-        price_vs_base = clip((p - base_h) / (base_h + eps))
-
-        p1 = (self._price_lag_1h[0]
-              if len(self._price_lag_1h) == self._price_lag_1h.maxlen else p)
-        p4 = (self._price_lag_4h[0]
-              if len(self._price_lag_4h) == self._price_lag_4h.maxlen else p)
-        mom_1h = clip(p / (p1 + eps) - 1.0)
-        mom_4h = clip(p / (p4 + eps) - 1.0)
-
-        vol = clip(std / (mean + eps), 0.0, 5.0)
-
-        mb = float(getattr(self.model, "market_price_margin_buy", 1.0))
-        ms = float(getattr(self.model, "market_price_margin_sell", 0.3))
-        spread_norm = clip((mb + ms) / (p + mb + eps), 0.0, 5.0)
-
         t = self.model.current_date
-        hour_rad = 2 * np.pi * t.hour / 24.0
-        dow_rad = 2 * np.pi * t.weekday() / 7.0
-        mon_rad = 2 * np.pi * (t.month - 1) / 12.0
-
-        return [soc, headroom_ceiling, headroom_floor, price_norm, percentile,
-                price_vs_base, mom_1h, mom_4h, vol, spread_norm,
-                float(np.sin(hour_rad)), float(np.cos(hour_rad)),
-                float(np.sin(dow_rad)), float(np.cos(dow_rad)),
-                float(np.sin(mon_rad)), float(np.cos(mon_rad))]
+        return state_features(
+            soc=self.soc, soc_floor=self.soc_floor, soc_ceiling=self.soc_ceiling,
+            price=self.get_current_price(), price_history=self.price_history,
+            lag_1h=self._price_lag_1h, lag_4h=self._price_lag_4h,
+            hourly_ewma=self.hourly_price_ewma,
+            hour=t.hour, weekday=t.weekday(), month=t.month,
+            margin_buy=getattr(self.model, "market_price_margin_buy", 1.0),
+            margin_sell=getattr(self.model, "market_price_margin_sell", 0.3),
+        )
 
     def action_to_bid(self, action):
         """Map SAC action ∈ [-1, 1] to a price-taking market bid/ask.
@@ -657,15 +644,14 @@ class storage(mesa.Agent):
 
         Returned raw (in €); the SACLearner applies reward_scale.
         """
-        cashflow = (sold - bought) * p_decision / 100.0
-        inventory_delta = (p_now * soc_new - p_decision * soc_old) * self.capacity / 100.0
-        reward = cashflow + inventory_delta
-
-        # Hard-limit penalty only — soft band (0.20–0.85) is left to the policy
-        if soc_new < 0.05 or soc_new > 0.97:
-            reward -= 0.5
-
-        return reward
+        return mark_to_market_reward(
+            bought=bought, sold=sold, p_decision=p_decision, p_now=p_now,
+            soc_old=soc_old, soc_new=soc_new, capacity=self.capacity,
+            soc_floor=self.soc_floor, soc_ceiling=self.soc_ceiling,
+            shaping_weight=self.soc_shaping_weight,
+            total_env_steps=self.learner.total_env_steps,
+            shaping_anneal=self.soc_shaping_anneal,
+        )
 
     def update_status(self):
         """Apply the settled trade to SOC and run one SAC learning step.
@@ -738,12 +724,13 @@ class storage(mesa.Agent):
             # action; the critic, however, learns from (s, forced_a, r, s') that
             # draining to the floor triggers a costly recharge — the exact signal
             # that teaches the agent low SOC is bad. Excluding them hid that cost.
-            self.learner.push(self.last_state, self.last_action, reward, next_state, 0.0)
+            if not self.eval_mode:
+                self.learner.push(self.last_state, self.last_action, reward, next_state, 0.0)
 
-            diag = self.learner.learn()
-            if diag:
-                # merge so actor-only fields (entropy) persist across critic-only steps
-                self.last_diagnostics.update(diag)
+                diag = self.learner.learn()
+                if diag:
+                    # merge so actor-only fields (entropy) persist across critic-only steps
+                    self.last_diagnostics.update(diag)
 
             if self.model.stepcount % self.update_frequency == 0:
                 self.episode_counter += 1
@@ -787,6 +774,7 @@ class storage(mesa.Agent):
         record = {
             "algorithm": "sac",
             "agent_id": int(self.unique_id),
+            "epoch": int(self.current_epoch),
             "episode": int(self.episode_counter),
             "timestamp": str(self.model.current_date),
             "cumulative_reward": round(float(self.cumulative_reward), 4),
@@ -869,7 +857,7 @@ class storage(mesa.Agent):
             
             elif self.method == "learning":
                 state = self.build_state()
-                action = self.learner.select_action(state, deterministic=False)
+                action = self.learner.select_action(state, deterministic=self.eval_mode)
 
                 # Hard safety overrides (emergencies only; excluded from replay)
                 override = False

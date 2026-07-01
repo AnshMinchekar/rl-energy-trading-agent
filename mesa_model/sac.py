@@ -149,7 +149,7 @@ class SACLearner:
                  gamma=0.99, tau=0.005, lr=3e-4, target_entropy=-1.0,
                  buffer_size=100_000, batch_size=256, warmup_steps=2_000,
                  actor_update_every=2, updates_per_step=1,
-                 reward_scale=10.0, seed=42, device="cpu"):
+                 reward_scale=10.0, alpha_min=0.0, seed=42, device="cpu"):
         torch.manual_seed(seed)
         self.device = torch.device(device)
         self.gamma = gamma
@@ -160,6 +160,12 @@ class SACLearner:
         self.updates_per_step = updates_per_step   # gradient updates per env step (UTD ratio)
         self.reward_scale = reward_scale
         self.target_entropy = target_entropy
+        # Floor on the entropy temperature. With a small data budget the policy
+        # becomes over-confident and auto-α decays to ~0, killing exploration
+        # before the policy is any good. Clamping α ≥ alpha_min keeps exploration
+        # alive long enough to escape the drain/hoard local optima.
+        self.alpha_min = alpha_min
+        self._log_alpha_min = float(np.log(alpha_min)) if alpha_min > 0 else None
         self.action_dim = action_dim
 
         self.actor = GaussianActor(state_dim, action_dim, hidden).to(self.device)
@@ -217,13 +223,16 @@ class SACLearner:
     # -- learning -----------------------------------------------------------
     def learn(self):
         """Run ``updates_per_step`` gradient updates (UTD ratio). Returns the
-        most recent non-None diagnostics."""
-        diag = None
+        merged diagnostics across all updates in this call (or None if warming
+        up). Merging matters: actor-only fields (e.g. ``entropy``) are produced
+        on a subset of the updates, so returning just the last update's dict
+        would silently drop them whenever the final update is critic-only."""
+        diag = {}
         for _ in range(self.updates_per_step):
             d = self.update()
             if d is not None:
-                diag = d
-        return diag
+                diag.update(d)
+        return diag or None
 
     def update(self):
         if len(self.buffer) < max(self.batch_size, self.warmup_steps):
@@ -266,6 +275,9 @@ class SACLearner:
             self.alpha_opt.zero_grad()
             alpha_loss.backward()
             self.alpha_opt.step()
+            if self._log_alpha_min is not None:
+                with torch.no_grad():
+                    self.log_alpha.clamp_(min=self._log_alpha_min)
 
             # Polyak update of target critics
             self._soft_update(self.q1, self.q1_t)
@@ -294,6 +306,23 @@ class SACLearner:
             "total_env_steps": self.total_env_steps,
             "total_updates": self.total_updates,
         }
+
+    def load_state_dict(self, sd):
+        self.actor.load_state_dict(sd["actor"])
+        self.q1.load_state_dict(sd["q1"])
+        self.q2.load_state_dict(sd["q2"])
+        self.q1_t.load_state_dict(sd["q1_t"])
+        self.q2_t.load_state_dict(sd["q2_t"])
+        with torch.no_grad():
+            self.log_alpha.copy_(sd["log_alpha"].to(self.device))
+        self.total_env_steps = int(sd.get("total_env_steps", self.total_env_steps))
+        self.total_updates = int(sd.get("total_updates", self.total_updates))
+
+    def save(self, path):
+        torch.save(self.state_dict(), path)
+
+    def load(self, path):
+        self.load_state_dict(torch.load(path, map_location=self.device))
 
 
 # ---------------------------------------------------------------------------

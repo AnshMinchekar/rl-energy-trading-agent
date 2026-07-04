@@ -19,12 +19,17 @@ import warnings
 warnings.simplefilter("ignore", category=FutureWarning)
 import gc
 from mesa_model.sac import SACLearner
-from mesa_model.storage_logic import state_features, mark_to_market_reward
+from mesa_model.storage_logic import (
+    state_features, mark_to_market_reward,
+    ACTION_DEADBAND, ASK_PRICE_FLOOR, STATE_DIM, FORECAST_STEPS,
+)
 
 def initialize(self, typ, factor, cosphi, bus):
     self.typ=typ
     curve=self.model.grid.load.profile[self.model.grid.load.agent_id==self.unique_id].values[0]+"_pload"
     self.a_power_profile=pd.DataFrame({"time":pd.to_datetime(config.load_profile["time"],format='%d.%m.%Y %H:%M',  errors='coerce'),"power":config.load_profile[curve].astype(float)*factor/self.model.sref})
+    # O(1) per-step lookup (the DataFrame stays: the HN optimizer consumes it)
+    self._power_by_time=dict(zip(self.a_power_profile["time"], self.a_power_profile["power"]))
     self.bus=bus
     self.profile=curve
     self.cosphi=float(cosphi)
@@ -35,14 +40,9 @@ def initialize(self, typ, factor, cosphi, bus):
     self.LEC_participation=True
 def provide_a_power_range(self):
     try:
-        power=abs(self.a_power_profile.loc[self.a_power_profile["time"]==self.model.current_date,"power"])
-        if power.empty:
-            power=0
-        else:
-            power=power.values[0]
-        a_power_min=power
-        a_power_max=power
-        return [a_power_min, a_power_max]    
+        power=self._power_by_time.get(self.model.current_date)
+        power=0 if power is None or pd.isna(power) else abs(power)
+        return [power, power]
     except Exception as e:
         print(self.model.current_date,";", "agent_id:", self.unique_id,";", "Error when reading load_profile", str(e))
         return[0,0]
@@ -135,6 +135,7 @@ class res(mesa.Agent):
         super().__init__(model)
         factor=float(factor)
         self.a_power_profile=pd.DataFrame({"time":pd.to_datetime(config.res_profile["time"],format='%d.%m.%Y %H:%M',  errors='coerce'),"power":config.res_profile[curve].astype(float)*factor*(-1)/self.model.sref})
+        self._power_by_time=dict(zip(self.a_power_profile["time"], self.a_power_profile["power"]))
         self.price=0
         self.bus=bus
         self.profile=curve
@@ -190,10 +191,14 @@ class ext_grid(mesa.Agent):
    def step(self):
         price=self.energy_price.loc[self.energy_price["time"]==self.model.current_date,"price"]
         if price.empty:
+            # A data gap must not silently clear the market at a free grid.
+            print(f"WARNING [ext_grid]: no spot price for {self.model.current_date} "
+                  f"- grid disabled this step", flush=True)
             self.price=0
             self.energy=0
         else:
             self.price=price.values[0]
+            self.energy=10000/self.model.sref   # restore capacity after any gap
         self.coefficients_bid=[0,(self.price -self.margin_sell)*(self.model.timestep.seconds/(60*60))]
         self.coefficients_ask=[0,(self.price +self.margin_buy)*(self.model.timestep.seconds/(60*60))]
         self.bid=[0,self.energy,self.bid_function, "lin"]
@@ -324,17 +329,17 @@ class heatpump(mesa.Agent):
             return(P_min)
     
     def update_status(self):
+            energy=0
             if len(self.model.results)!=0:
                 try:
                     result=self.model.results[int(self.model.stepcount-1)]["agents"]
                 except Exception:
                     result={}
                 if isinstance(result, pd.DataFrame):
-                    result=result[result["Agent ID"]==self.unique_id]   
-                    energy=np.abs(result["Energy bought [kWh]"]).values[0]
-            else:
-                energy=0
-                
+                    result=result[result["Agent ID"]==self.unique_id]
+                    if len(result)>0:
+                        energy=np.abs(result["Energy bought [kWh]"]).values[0]
+
             T_amb = float(self.model.temperature_df[self.model.temperature_df.loc[:,"time"]==self.model.current_date].values[0][1])
             Q_dot=np.abs(energy/self.model.timestep.seconds*(60*60)*self.cop)
             T_in=self.T_in
@@ -442,9 +447,9 @@ class storage(mesa.Agent):
 
     def _setup_learning(self):
         """Initialise SAC learner + bookkeeping for the learning method."""
-        # 16-D state (see build_state / docs/redesign-plan.md)
-        self.state_dim = 16
-        self.gamma = 0.99           # ≈25 h horizon: spans the daily price cycle
+        # 20-D state (see storage_logic.state_features)
+        self.state_dim = STATE_DIM
+        self.gamma = 0.996          # half-life ≈ 1.8 days: cross-day arbitrage visible
         self.reward_scale = 10.0    # lift tiny per-step € rewards above the entropy term
 
         self.learner = SACLearner(
@@ -538,14 +543,28 @@ class storage(mesa.Agent):
 
     def _initialize_price_cache(self):
         try:
-            price_df = self.model.market_price
+            price_df = self.model.market_price.sort_values("time")
             # Create dict for O(1) time-based lookup
             self._price_index = dict(zip(price_df["time"], price_df["price"]))
-            # Create array for percentile/average calculations
-            self._price_array = price_df["price"].values
+            # Array + time->position map for the known-future DA price features
+            self._price_array = price_df["price"].to_numpy(dtype=float)
+            self._price_pos = {t: i for i, t in enumerate(price_df["time"])}
             self._price_cache_ready = True
         except (AttributeError, TypeError, KeyError):
             self._price_cache_ready = False
+
+    def get_future_prices(self, k=FORECAST_STEPS):
+        """Next k known day-ahead prices after the current step (published
+        12-36 h ahead in reality, so reading them is not leakage). Padded by
+        state_features when the series runs out near the simulation end."""
+        if not self._price_cache_ready:
+            self._initialize_price_cache()
+        if not self._price_cache_ready:
+            return []
+        pos = self._price_pos.get(self.model.current_date)
+        if pos is None:
+            return []
+        return self._price_array[pos + 1: pos + 1 + k]
     
     def get_current_price(self):
         if not self._price_cache_ready:
@@ -566,10 +585,11 @@ class storage(mesa.Agent):
         return 30.0
 
     def build_state(self):
-        """16-D state vector (see docs/redesign-plan.md §4).
+        """20-D state vector (see storage_logic.state_features).
 
-        All price-derived features use only the rolling observed-price buffers
-        populated in update_status — no future data is read.
+        Backward-looking features use only the rolling observed-price buffers
+        populated in update_status; the forward features read the *known*
+        day-ahead prices (public ahead of delivery — legitimate, not leakage).
         """
         t = self.model.current_date
         return state_features(
@@ -580,15 +600,24 @@ class storage(mesa.Agent):
             hour=t.hour, weekday=t.weekday(), month=t.month,
             margin_buy=getattr(self.model, "market_price_margin_buy", 1.0),
             margin_sell=getattr(self.model, "market_price_margin_sell", 0.3),
+            future_prices=self.get_future_prices(),
         )
 
     def action_to_bid(self, action):
         """Map SAC action ∈ [-1, 1] to a price-taking market bid/ask.
 
-        The agent learns *when* and *how much* to trade; the price is a fixed
-        small spread around the current market price, just enough to clear
-        against the external-grid margin. Emergencies use aggressive prices to
-        guarantee a fill. Action sign: +charge, -discharge.
+        The agent learns *when* and *how much* to trade; the price is set so
+        the order *strictly* clears in the welfare LP. A bid at exactly
+        p+margin_buy ties the external grid's ask and then LOSES to the
+        gridfee_levies_ext term in the objective, so external buys never
+        cleared (night charging was impossible). The bid therefore crosses
+        margin + external gridfee + levies + ε. Storage is fee-exempt
+        (§118 EnWG) in the settlement accounting, so crossing the fee term is
+        purely a clearing device — the agent still settles at the uniform
+        slack price. Asks undercut p−margin_sell by ε (floored at
+        ASK_PRICE_FLOOR, so sells at negative prices do not clear).
+        A |action| < ACTION_DEADBAND is a deliberate hold — no order.
+        Action sign: +charge, -discharge.
         """
         self.ask = [0, 0, self.offer_function(0), "lin"]
         self.bid = [0, 0, self.offer_function(0), "lin"]
@@ -598,7 +627,12 @@ class storage(mesa.Agent):
         max_discharge, max_charge = self.provide_a_power()
         eps = 1e-6
         p = self.get_current_price()
-        spread = 0.2   # ct/kWh
+        margin_buy = getattr(self.model, "market_price_margin_buy", 1.0)
+        margin_sell = getattr(self.model, "market_price_margin_sell", 0.3)
+        # External-buy fee adder in the LP objective (ct/kWh) that the bid
+        # must also cross to clear against the grid.
+        fee_ext = (getattr(self.model, "gridfee_ext", 11.0)
+                   + getattr(self.model, "levies_ext", 4.7))
 
         # --- Emergency charge: SOC critically low ---
         if self.soc < 0.10:
@@ -611,42 +645,42 @@ class storage(mesa.Agent):
         # --- Emergency discharge: SOC critically high ---
         if self.soc > 0.95:
             if max_discharge > eps:
-                ask_price = 0.01
+                ask_price = ASK_PRICE_FLOOR
                 self.ask = [max_discharge, max_discharge, self.offer_function(ask_price), "lin"]
                 self.coefficients_ask = [0, ask_price * (self.model.timestep.seconds / 3600)]
             return
 
-        if action > eps:        # charge
+        if action > ACTION_DEADBAND:        # charge
             power = min(action * max_charge, max_charge)
             if power > eps:
-                bid_price = p + spread
+                bid_price = p + margin_buy + fee_ext + 0.01
                 self.bid = [0, power, self.offer_function(bid_price), "lin"]
                 self.coefficients_bid = [0, bid_price * (self.model.timestep.seconds / 3600)]
 
-        elif action < -eps:     # discharge
+        elif action < -ACTION_DEADBAND:     # discharge
             power = min(-action * max_discharge, max_discharge)
-            if power > eps:
-                ask_price = max(p - spread, 0.01)
+            ask_price = p - margin_sell - 0.01
+            if power > eps and ask_price >= ASK_PRICE_FLOOR:
                 self.ask = [0, power, self.offer_function(ask_price), "lin"]
                 self.coefficients_ask = [0, ask_price * (self.model.timestep.seconds / 3600)]
 
-    def compute_reward(self, bought, sold, p_decision, p_now, soc_old, soc_new):
-        """Mark-to-market wealth change in € (see docs/redesign-plan.md §3).
+    def compute_reward(self, bought, sold, p_buy, p_sell, p_decision, p_now,
+                       soc_old, soc_new):
+        """Mark-to-market wealth change in € (see storage_logic).
 
-            reward = cashflow + Δ(inventory value)
-                   = (sold − bought)·p_decision/100
-                     + (p_now·soc_new − p_decision·soc_old)·capacity/100
-
-        Cash flow values the trade at the price the agent saw when it acted
-        (p_decision); the inventory term revalues stored energy at the now-
-        observed price (p_now). Both are observed — no future leakage. This
-        removes the bias against buying that a per-step cash-flow reward has.
+        Cash is valued at the prices actually settled (p_buy / p_sell from the
+        clearing result); the inventory term is γ-corrected potential shaping
+        at liquidation value. Storage is fee-exempt, so no gridfee/levies.
 
         Returned raw (in €); the SACLearner applies reward_scale.
         """
+        margin_sell = getattr(self.model, "market_price_margin_sell", 0.3)
         return mark_to_market_reward(
-            bought=bought, sold=sold, p_decision=p_decision, p_now=p_now,
+            bought=bought, sold=sold, p_buy=p_buy, p_sell=p_sell,
+            p_decision=p_decision, p_now=p_now,
             soc_old=soc_old, soc_new=soc_new, capacity=self.capacity,
+            efficiency=self.efficiency, margin_sell=margin_sell,
+            gamma=self.gamma,
             soc_floor=self.soc_floor, soc_ceiling=self.soc_ceiling,
             shaping_weight=self.soc_shaping_weight,
             total_env_steps=self.learner.total_env_steps,
@@ -664,7 +698,8 @@ class storage(mesa.Agent):
             return
 
         try:
-            result = self.model.results[int(self.model.stepcount - 1)]["agents"]
+            step_result = self.model.results[int(self.model.stepcount - 1)]
+            result = step_result["agents"]
             result = result[result["Agent ID"] == self.unique_id]
         except (KeyError, IndexError):
             return
@@ -674,6 +709,15 @@ class storage(mesa.Agent):
 
         bought = float(result["Energy bought [kWh]"].to_numpy()[0])
         sold = float(result["Energy sold [kWh]"].to_numpy()[0])
+
+        # Uniform settlement price of the cleared step (€/kWh -> ct/kWh). Every
+        # agent settles at this slack price; falls back to the decision price.
+        try:
+            p_settle = float(step_result["Input_Grid"]["Market Price [€/kWh]"].to_numpy()[0]) * 100.0
+            if np.isnan(p_settle):
+                p_settle = None
+        except (KeyError, IndexError, TypeError, ValueError):
+            p_settle = None
 
         old_soc = self.soc
         energy_delta = bought * self.efficiency - sold / self.efficiency
@@ -706,16 +750,24 @@ class storage(mesa.Agent):
         self.cumulative_sold += sold
 
         if self.last_state is not None and self.last_action is not None:
-            reward = self.compute_reward(bought, sold, p_decision, p_now, old_soc, new_soc)
+            # Settled prices for the cash leg; fall back to the surrogate's
+            # price±margin model when the slack price is unavailable.
+            margin_buy = getattr(self.model, "market_price_margin_buy", 1.0)
+            margin_sell = getattr(self.model, "market_price_margin_sell", 0.3)
+            p_buy = p_settle if p_settle is not None else p_decision + margin_buy
+            p_sell = p_settle if p_settle is not None else p_decision - margin_sell
+
+            reward = self.compute_reward(bought, sold, p_buy, p_sell,
+                                         p_decision, p_now, old_soc, new_soc)
             self.cumulative_reward += reward
-            self.cumulative_profit += (sold - bought) * p_decision / 100.0   # realised cash (€)
+            self.cumulative_profit += (sold * p_sell - bought * p_buy) / 100.0  # realised cash (€)
 
             if bought > 0.01:
                 self.trade_count_buy += 1
-                self.buy_price_sum += p_decision
+                self.buy_price_sum += p_buy
             if sold > 0.01:
                 self.trade_count_sell += 1
-                self.sell_price_sum += p_decision
+                self.sell_price_sum += p_sell
 
             next_state = self.build_state()
 

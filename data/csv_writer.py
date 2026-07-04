@@ -52,7 +52,7 @@ class EntryWriter:
             self.HN_file.flush()
 
     
-    def write_entry(self, results, price, margin_sell, margin_buy, date):
+    def write_entry(self, results, price, margin_sell, margin_buy, date, hn_node=5):
             """Write an entry to the current file, creating a new file if needed."""
             self_consumption_direkt=0
             for node, group in  results["agents"].groupby('Node'):
@@ -169,7 +169,7 @@ class EntryWriter:
             del  entry
 
             for hn_id in range(len(results["Node_results"])):
-                if hn_id == 5:  #only write for selected HN, where storage agent is in.
+                if hn_id == hn_node:  #only write for the HN the learning storage agent is in.
                     columns=[
                         "Date",
                         "Agent ID",

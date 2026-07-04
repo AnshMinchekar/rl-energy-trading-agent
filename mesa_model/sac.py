@@ -5,7 +5,7 @@ Soft Actor-Critic (SAC) for the storage arbitrage agent.
 This module is self-contained and PyTorch-based. It is wired into the
 ``storage`` agent in ``mesa_model/agents.py`` via the ``SACLearner`` class.
 
-Design (see docs/redesign-plan.md):
+Design:
   * Squashed-Gaussian actor (reparameterised) → action ∈ (-1, 1)
   * Twin Q-critics + Polyak-averaged target critics (min-target → no overestimation)
   * Automatic entropy temperature α (target_entropy = -1 for a scalar action)

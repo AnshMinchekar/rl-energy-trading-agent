@@ -14,6 +14,19 @@ Units: prices in ct/kWh, energy in kWh, capacity in kWh, power in kW.
 
 import numpy as np
 
+# Actions with |a| below this are a deliberate "hold" — no order is placed.
+# A tanh-squashed Gaussian almost never outputs exactly 0, so without a
+# deadband the agent trades (and pays spread) every single step.
+ACTION_DEADBAND = 0.05
+
+# Live asks are floored at this price (a sell below it cannot clear), so the
+# surrogate applies the same no-fill rule for sells when p - margin_sell is
+# under the floor (e.g. negative prices).
+ASK_PRICE_FLOOR = 0.01
+
+# How many future known day-ahead prices the state can see (24 x 15 min = 6 h).
+FORECAST_STEPS = 24
+
 
 def _clip(x, lo=-5.0, hi=5.0):
     return float(np.clip(x, lo, hi))
@@ -21,12 +34,18 @@ def _clip(x, lo=-5.0, hi=5.0):
 
 def state_features(soc, soc_floor, soc_ceiling, price, price_history,
                    lag_1h, lag_4h, hourly_ewma, hour, weekday, month,
-                   margin_buy, margin_sell):
-    """Build the 16-D state vector (see docs/redesign-plan.md §4).
+                   margin_buy, margin_sell, future_prices=None):
+    """Build the 20-D state vector.
 
-    All price-derived features use only the observed-price buffers passed in —
-    no future data. ``lag_1h`` / ``lag_4h`` are deques with a ``maxlen`` (4 and
-    16 respectively); ``hourly_ewma`` is a {hour: ewma_price} dict.
+    Backward-looking features use only the observed-price buffers passed in.
+    ``future_prices`` are the next known *day-ahead* prices (published 12-36 h
+    ahead in reality, so using them is not leakage); pass the next
+    ``FORECAST_STEPS`` prices, or None/short — missing entries are padded with
+    the current price (features -> 0).
+
+    All price comparisons are differences normalised by the rolling std, not
+    ratios: the price series contains thousands of negative / near-zero points
+    where ratio features blow up or flip sign.
     """
     eps = 1e-6
 
@@ -35,28 +54,39 @@ def state_features(soc, soc_floor, soc_ceiling, price, price_history,
             if len(price_history) > 0 else np.array([p], dtype=float))
     mean = float(hist.mean())
     std = float(hist.std())
+    denom = std + eps
 
     soc = float(soc)
     span = (soc_ceiling - soc_floor) + eps
     headroom_ceiling = _clip((soc_ceiling - soc) / span)
     headroom_floor = _clip((soc - soc_floor) / span)
 
-    price_norm = _clip((p - mean) / (std + eps)) if std > eps else 0.0
+    price_norm = _clip((p - mean) / denom) if std > eps else 0.0
     percentile = float(np.mean(hist < p)) if len(hist) > 1 else 0.5
 
     base_h = hourly_ewma.get(hour, mean)
-    price_vs_base = _clip((p - base_h) / (base_h + eps))
+    price_vs_base = _clip((p - base_h) / denom)
 
     p1 = lag_1h[0] if len(lag_1h) == lag_1h.maxlen else p
     p4 = lag_4h[0] if len(lag_4h) == lag_4h.maxlen else p
-    mom_1h = _clip(p / (p1 + eps) - 1.0)
-    mom_4h = _clip(p / (p4 + eps) - 1.0)
+    mom_1h = _clip((p - p1) / denom)
+    mom_4h = _clip((p - p4) / denom)
 
-    vol = _clip(std / (mean + eps), 0.0, 5.0)
+    vol = _clip(std / (abs(mean) + eps), 0.0, 5.0)
 
-    mb = float(margin_buy)
-    ms = float(margin_sell)
-    spread_norm = _clip((mb + ms) / (p + mb + eps), 0.0, 5.0)
+    # Round-trip transaction spread relative to the price volatility the agent
+    # could capture — the trade-or-hold economics signal.
+    spread_norm = _clip((float(margin_buy) + float(margin_sell)) / denom, 0.0, 5.0)
+
+    # Known future day-ahead prices (pad with p so missing data -> 0 features).
+    fut = np.full(FORECAST_STEPS, p, dtype=float)
+    if future_prices is not None and len(future_prices) > 0:
+        f = np.asarray(future_prices, dtype=float)[:FORECAST_STEPS]
+        fut[:len(f)] = f
+    fwd_1h = _clip((float(fut[:4].mean()) - p) / denom)
+    fwd_6h_mean = _clip((float(fut.mean()) - p) / denom)
+    fwd_6h_min = _clip((float(fut.min()) - p) / denom)
+    fwd_6h_max = _clip((float(fut.max()) - p) / denom)
 
     hour_rad = 2 * np.pi * hour / 24.0
     dow_rad = 2 * np.pi * weekday / 7.0
@@ -66,18 +96,45 @@ def state_features(soc, soc_floor, soc_ceiling, price, price_history,
             price_vs_base, mom_1h, mom_4h, vol, spread_norm,
             float(np.sin(hour_rad)), float(np.cos(hour_rad)),
             float(np.sin(dow_rad)), float(np.cos(dow_rad)),
-            float(np.sin(mon_rad)), float(np.cos(mon_rad))]
+            float(np.sin(mon_rad)), float(np.cos(mon_rad)),
+            fwd_1h, fwd_6h_mean, fwd_6h_min, fwd_6h_max]
 
 
-def mark_to_market_reward(bought, sold, p_decision, p_now, soc_old, soc_new,
-                          capacity, soc_floor, soc_ceiling,
+STATE_DIM = 20
+
+
+def liquidation_value(price, soc, capacity, efficiency, margin_sell):
+    """€ the stored energy would realise if sold now: grid-side energy is
+    soc·capacity·efficiency, sold no better than price − margin_sell (and a
+    sell below the ask floor cannot clear, hence the max with 0)."""
+    return soc * capacity * efficiency * max(price - margin_sell, 0.0) / 100.0
+
+
+def mark_to_market_reward(bought, sold, p_buy, p_sell, p_decision, p_now,
+                          soc_old, soc_new, capacity, efficiency, margin_sell,
+                          gamma, soc_floor, soc_ceiling,
                           shaping_weight, total_env_steps, shaping_anneal):
-    """Mark-to-market wealth change in € (see docs/redesign-plan.md §3) plus the
-    annealed SOC-band shaping. Returned raw; the SACLearner applies reward_scale.
+    """Mark-to-market wealth change in € plus the annealed SOC-band shaping.
+
+    cashflow values the trade at the prices actually paid/received (p_buy /
+    p_sell — the settled price in the live market, price ± margin in the
+    surrogate), NOT the raw spot price, so the reward sees the true round-trip
+    transaction cost. Storage is fee-exempt (§118 EnWG), so no gridfee/levies
+    appear here or in the live settlement.
+
+    The inventory term is potential-based shaping Φ with the γ-correction
+    (γ·Φ(s') − Φ(s)), which leaves the optimal policy exactly equal to the
+    pure-realised-cash optimum while fixing the credit-assignment bias against
+    buying. Φ values stored energy at its *liquidation* value
+    (η·(p − margin_sell)·soc·capacity), not the mid price — the mid-price
+    version over-rewarded hoarding by the efficiency loss + sell margin.
+
+    Returned raw (in €); the SACLearner applies reward_scale.
     """
-    cashflow = (sold - bought) * p_decision / 100.0
-    inventory_delta = (p_now * soc_new - p_decision * soc_old) * capacity / 100.0
-    reward = cashflow + inventory_delta
+    cashflow = (sold * p_sell - bought * p_buy) / 100.0
+    phi_old = liquidation_value(p_decision, soc_old, capacity, efficiency, margin_sell)
+    phi_new = liquidation_value(p_now, soc_new, capacity, efficiency, margin_sell)
+    reward = cashflow + gamma * phi_new - phi_old
 
     # Hard physical bounds — always on.
     if soc_new < 0.05 or soc_new > 0.97:

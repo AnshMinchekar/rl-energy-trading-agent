@@ -19,8 +19,8 @@ re-uses the learner from the previous epoch. The warm-up only happens once
 evaluation pass); intermediate epochs are training-only for speed.
 
 NOTE: each step runs a Gurobi market solve (~2.25 s), so one epoch ≈ 5 h of
-wall-clock. Many epochs over the live market is expensive — see the report in
-analysis/rl_agent_failure_report.md for the surrogate-environment alternative.
+wall-clock. Many epochs over the live market is expensive — train on the fast
+surrogate instead (train_surrogate.py) and use this script for evaluation.
 """
 
 import gc
@@ -81,6 +81,7 @@ def main():
                   f"{'  (final / evaluation pass)' if is_final else '  (training pass)'}"
                   f"\n{'#'*60}\n", flush=True)
 
+        hn_node = int(agent.bus) if agent is not None else 5
         for n in range(m.total_steps):
             m.step()
             # Write per-step CSV only on the final (evaluation) epoch.
@@ -88,7 +89,8 @@ def main():
                 result = m.results[int(m.stepcount)]
                 price = m.market_price[m.market_price["time"] == m.current_date]["price"].values[0]
                 writer.write_entry(result, price, m.market_price_margin_sell,
-                                   m.market_price_margin_buy, m.current_date)
+                                   m.market_price_margin_buy, m.current_date,
+                                   hn_node=hn_node)
             if n % 96 == 0:
                 gc.collect()
                 print(f"Simulation completed a day")

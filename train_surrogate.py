@@ -8,18 +8,22 @@ weeks the live market would take. Physical parameters and the price series are
 read from a constructed LEM model so they are byte-identical to the live agent;
 state and reward come from the shared mesa_model/storage_logic.py.
 
-Train/eval split: the policy trains on a wide spot-price window (default the two
-full years 2021-2022, env vars SAC_TRAIN_START/SAC_TRAIN_END) read straight from
-spot_price.csv, bypassing the config window. The held-out evaluation quarter is
-config.yaml's simulation window (default Q1 2023) and must not overlap the
-training range, so the live eval is genuinely out-of-sample.
+Train/validation/test split:
+  * TRAIN      (SAC_TRAIN_START/END, default 2021-01-01 .. 2022-09-30) — SAC
+    interacts and learns here (random episode starts).
+  * VALIDATION (SAC_VAL_START/END, default 2022-10-01 .. 2022-12-31) — never
+    trained on; a deterministic pass runs every LOG_EVERY steps and the policy
+    with the BEST validation profit is checkpointed (SAC can degrade late in
+    training, so "last" is not "best").
+  * TEST       config.yaml's simulation window (default Q1 2023) — the live
+    Mesa-market eval; must not overlap the other two.
 
 Usage:
-    # 1. Train the brain on 2 years of prices (fast, no Gurobi):
+    # 1. Train the brain (fast, no Gurobi):
     SAC_SURROGATE_STEPS=300000 python train_surrogate.py
 
-    # 2. Evaluate the frozen policy on the held-out quarter in the full Mesa
-    #    market (config.yaml window, live Gurobi solve, deterministic):
+    # 2. Evaluate the frozen best-validation policy on the held-out quarter in
+    #    the full Mesa market (config.yaml window, live Gurobi solve):
     SAC_LOAD_POLICY=output/sac/surrogate_policy.pt SAC_EVAL=1 python main.py
 """
 
@@ -39,14 +43,12 @@ from mesa_model.storage_env import StorageArbitrageEnv
 TOTAL_STEPS = int(os.environ.get("SAC_SURROGATE_STEPS", "300000"))
 LOG_EVERY = int(os.environ.get("SAC_LOG_EVERY", "5000"))
 OUT_PATH = os.environ.get("SAC_POLICY_OUT", "output/sac/surrogate_policy.pt")
-SEED = 42
+SEED = int(os.environ.get("SAC_SEED", "42"))
 
-# Train the policy on a wide spot-price window (default: the two full years
-# 2021-2022). The held-out evaluation quarter lives in config.yaml's simulation
-# window (default Q1 2023) and must NOT overlap this range — see the live eval
-# in main.py with SAC_EVAL=1.
 TRAIN_START = os.environ.get("SAC_TRAIN_START", "01.01.2021 00:00")
-TRAIN_END = os.environ.get("SAC_TRAIN_END", "31.12.2022 23:45")
+TRAIN_END = os.environ.get("SAC_TRAIN_END", "30.09.2022 23:45")
+VAL_START = os.environ.get("SAC_VAL_START", "01.10.2022 00:00")
+VAL_END = os.environ.get("SAC_VAL_END", "31.12.2022 23:45")
 
 
 def _learning_agent(m):
@@ -56,7 +58,7 @@ def _learning_agent(m):
     raise RuntimeError("No learning storage agent found in the model.")
 
 
-def _price_series(m, start=TRAIN_START, end=TRAIN_END):
+def _price_series(m, start, end):
     """Spot series over an arbitrary [start, end] window, byte-identical to the
     ext-grid agent's energy_price (mesa_model/agents.py) but NOT limited to the
     config simulation window — config windows every time-stamped CSV at load time
@@ -67,33 +69,33 @@ def _price_series(m, start=TRAIN_START, end=TRAIN_END):
                         "scenario_data", "spot_price.csv")
     df = pd.read_csv(path, sep=";", decimal=",")
     df["time"] = pd.to_datetime(df["time"], format="%d.%m.%Y %H:%M", errors="coerce")
-    # Same unit scaling the ext-grid agent applies (agents.py:170).
+    # Same unit scaling the ext-grid agent applies (agents.py).
     df["price"] = df["price (Ct/kWh)"].astype(float) / (100 / m.sref)
     lo = pd.to_datetime(start, format="%d.%m.%Y %H:%M")
     hi = pd.to_datetime(end, format="%d.%m.%Y %H:%M")
     df = df[(df["time"] >= lo) & (df["time"] <= hi)]
     df = df.dropna(subset=["time", "price"]).sort_values("time")
     if df.empty:
-        raise RuntimeError(f"No spot prices in training window {start} .. {end}")
+        raise RuntimeError(f"No spot prices in window {start} .. {end}")
     return df["price"].to_numpy(dtype=float), list(df["time"])
 
 
-def build_env(m):
-    agent = _learning_agent(m)
-    prices, timestamps = _price_series(m)
+def _make_env(m, agent, prices, timestamps, *, shaping, episode_len,
+              random_start, random_soc, seed):
     dt_h = m.timestep.seconds / 3600.0
-    env = StorageArbitrageEnv(
+    return StorageArbitrageEnv(
         prices=prices, timestamps=timestamps,
         capacity=agent.capacity, max_power_kw=agent.max_power,
         efficiency=agent.efficiency, discharge_per_step=agent.discharge, dt_h=dt_h,
         soc_start=agent.soc, soc_floor=agent.soc_floor, soc_ceiling=agent.soc_ceiling,
         margin_buy=getattr(m, "market_price_margin_buy", 1.0),
         margin_sell=getattr(m, "market_price_margin_sell", 0.3),
-        soc_shaping_weight=agent.soc_shaping_weight,
+        gamma=agent.gamma,
+        soc_shaping_weight=agent.soc_shaping_weight if shaping else 0.0,
         soc_shaping_anneal=agent.soc_shaping_anneal,
-        episode_len=96, random_start=True, random_soc=True, seed=SEED,
+        episode_len=episode_len, random_start=random_start,
+        random_soc=random_soc, seed=seed,
     )
-    return env, agent
 
 
 def make_learner(agent):
@@ -105,24 +107,15 @@ def make_learner(agent):
     )
 
 
-def evaluate(env, learner, n_steps=8000):
-    """Deterministic profit over a contiguous window (true performance, no
-    exploration). Uses a fresh fixed-start env pass."""
-    eval_env = StorageArbitrageEnv(
-        prices=env.prices, timestamps=env.timestamps, capacity=env.capacity,
-        max_power_kw=env.max_power_kw, efficiency=env.efficiency,
-        discharge_per_step=env.discharge, dt_h=env.dt_h, soc_start=env.soc_start,
-        soc_floor=env.soc_floor, soc_ceiling=env.soc_ceiling,
-        margin_buy=env.margin_buy, margin_sell=env.margin_sell,
-        soc_shaping_weight=0.0, soc_shaping_anneal=env.soc_shaping_anneal,
-        episode_len=n_steps, random_start=False, random_soc=False, seed=0,
-    )
-    s = eval_env.reset()
+def evaluate(env, learner):
+    """Deterministic profit over one contiguous pass of `env` (no exploration,
+    no shaping). Resets the env; runs to the end of its price series."""
+    s = env.reset()
     profit = 0.0
     socs = []
-    for _ in range(n_steps):
+    while True:
         a = learner.select_action(s, deterministic=True)
-        s, _, done, info = eval_env.step(a, learner.total_env_steps)
+        s, _, done, info = env.step(a, learner.total_env_steps)
         profit += info["profit_eur"]
         socs.append(info["soc"])
         if done:
@@ -132,14 +125,29 @@ def evaluate(env, learner, n_steps=8000):
 
 def main():
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
-    env, agent = build_env(model)
+    agent = _learning_agent(model)
+
+    train_prices, train_ts = _price_series(model, TRAIN_START, TRAIN_END)
+    val_prices, val_ts = _price_series(model, VAL_START, VAL_END)
+
+    env = _make_env(model, agent, train_prices, train_ts, shaping=True,
+                    episode_len=96, random_start=True, random_soc=True, seed=SEED)
+    # Validation: one deterministic pass over the whole held-out window.
+    val_env = _make_env(model, agent, val_prices, val_ts, shaping=False,
+                        episode_len=len(val_prices), random_start=False,
+                        random_soc=False, seed=0)
     learner = make_learner(agent)
-    print(f"Surrogate: {len(env.prices)} price points "
-          f"({env.timestamps[0]} .. {env.timestamps[-1]}) "
-          f"| capacity={env.capacity:.0f} kWh "
-          f"| max_power={env.max_power_kw:.0f} kW | eff={env.efficiency:.3f} "
-          f"| discharge/step={env.discharge:.5f}")
+
+    print(f"Surrogate: train {len(train_prices)} pts ({train_ts[0]} .. {train_ts[-1]}) "
+          f"| val {len(val_prices)} pts ({val_ts[0]} .. {val_ts[-1]})")
+    print(f"Battery: capacity={env.capacity:.0f} kWh | max_power={env.max_power_kw:.0f} kW "
+          f"| eff={env.efficiency:.3f} | discharge/step={env.discharge:.5f} "
+          f"| state_dim={env.state_dim}")
     print(f"Training for {TOTAL_STEPS} steps...\n", flush=True)
+
+    best_path = OUT_PATH
+    last_path = OUT_PATH.replace(".pt", "_last.pt")
+    best_val = -np.inf
 
     state = env.reset()
     ep_profit = ep_reward = 0.0
@@ -165,17 +173,21 @@ def main():
 
         if step % LOG_EVERY == 0:
             rate = step / (time.time() - t0)
-            ev_profit, ev_soc, ev_lo, ev_hi = evaluate(env, learner)
+            v_profit, v_soc, v_lo, v_hi = evaluate(val_env, learner)
+            star = ""
+            if v_profit > best_val:
+                best_val = v_profit
+                learner.save(best_path)
+                star = "  *best*"
             print(f"step {step:>7d} | {rate:6.0f} st/s | alpha {learner.alpha.item():.3f} "
                   f"| train profit/day {np.mean(recent_profit) if recent_profit else 0:+.2f} "
-                  f"| EVAL profit {ev_profit:+8.2f} EUR  SOC {ev_soc*100:4.1f}% "
-                  f"[{ev_lo*100:.0f}-{ev_hi*100:.0f}]", flush=True)
+                  f"| VAL profit {v_profit:+8.2f} EUR  SOC {v_soc*100:4.1f}% "
+                  f"[{v_lo*100:.0f}-{v_hi*100:.0f}]{star}", flush=True)
 
-    learner.save(OUT_PATH)
-    ev_profit, ev_soc, ev_lo, ev_hi = evaluate(env, learner)
-    print(f"\nDone in {(time.time()-t0)/60:.1f} min. Saved policy -> {OUT_PATH}")
-    print(f"Final deterministic eval: profit {ev_profit:+.2f} EUR | "
-          f"SOC mean {ev_soc*100:.1f}% range [{ev_lo*100:.0f}-{ev_hi*100:.0f}]")
+    learner.save(last_path)
+    print(f"\nDone in {(time.time()-t0)/60:.1f} min.")
+    print(f"Best validation policy -> {best_path} ({best_val:+.2f} EUR over val window)")
+    print(f"Last policy            -> {last_path}")
 
 
 if __name__ == "__main__":

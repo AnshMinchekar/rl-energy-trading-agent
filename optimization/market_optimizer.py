@@ -34,6 +34,10 @@ class MarketOptimizer:
         self.results_template = self._initialize_result_template()
         self.solver_name = solver
         self._solver_instance = SolverFactory(solver)
+        # agent_id -> model index (Params are initialised in list order, so
+        # list position == RangeSet index). Avoids an O(n) scan per agent per step.
+        self._bid_idx = {b.agent_id: i for i, b in enumerate(self.bid_static)}
+        self._ask_idx = {a.agent_id: j for j, a in enumerate(self.ask_static)}
 
        
 
@@ -394,10 +398,10 @@ class MarketOptimizer:
         
         # Update bids that have data
         for bid in bid_round_data:
-            i = next(
-                    (i for i in m.BIDS if m.id_bid[i] == bid.agent_id),
-                    None
-                )
+            i = self._bid_idx.get(bid.agent_id)
+            if i is None:
+                print(f"⚠️ Warning: No bid index for agent_id={bid.agent_id}")
+                continue
             m.a_bid[i].set_value(bid.f_coef[0])
             m.b_bid[i].set_value(bid.f_coef[1] if len(bid.f_coef) > 1 else 0.0)
             m.c_bid[i].set_value(bid.f_coef[2] if len(bid.f_coef) > 2 else 0.0)
@@ -421,12 +425,9 @@ class MarketOptimizer:
 
         # Update asks that have data
         for ask in ask_round_data:
-            j = next(
-                    (j for j in m.ASKS if m.id_ask[j] == ask.agent_id),
-                    None
-                )
+            j = self._ask_idx.get(ask.agent_id)
             if j is None:
-                print(f"⚠️ Warning: No index for agent_id={ask.agent_id}")
+                print(f"⚠️ Warning: No ask index for agent_id={ask.agent_id}")
                 continue
             m.a_ask[j].set_value(ask.f_coef[0])
             m.b_ask[j].set_value(ask.f_coef[1] if len(ask.f_coef) > 1 else 0.0)
@@ -531,11 +532,6 @@ class MarketOptimizer:
 
         # --- 4) Agent-level split (SC / LEC / External), Mesa-free ---
         # We distribute each node’s SC/LEC/EXT to agents by nodal share of energy.
-        # Build outputs:
-        agent_pw_sc  = pd.DataFrame(columns=["Agent ID", "HN Self-Consumption [kWh]"])
-        agent_pw_lec = pd.DataFrame(columns=["Agent ID", "Energy LEC [kWh]"])
-        agent_pw_ext = pd.DataFrame(columns=["Agent ID", "Energy External [kWh]"])
-
         # Pre-sum nodal totals from demand/supply vectors
         # (They already contain Node & Energy [kWh] after your scaling)
         demand_node_sum = res.demand.groupby("Node")["Energy [kWh]"].sum().to_dict()
@@ -572,9 +568,6 @@ class MarketOptimizer:
                 else:
                     a_sc = a_ext = a_lec = 0.0
 
-                agent_pw_sc.loc[len(agent_pw_sc)]   = [aid,  a_sc]
-                agent_pw_ext.loc[len(agent_pw_ext)] = [aid,  a_ext]
-                agent_pw_lec.loc[len(agent_pw_lec)] = [aid,  a_lec]
                 if aid in res.agents["Agent ID"].values:
                     res.agents.loc[res.agents["Agent ID"] == aid, "Energy bought [kWh]"] = e_kWh
                     res.agents.loc[res.agents["Agent ID"] == aid, "bid price [€/kWh]"] = row["relative Price [€/kWh]"]
@@ -596,10 +589,7 @@ class MarketOptimizer:
                     a_lec = -np.maximum(node_LEC_kWh[node], 0.0) * share
                 else:
                     a_sc = a_ext = a_lec = 0.0
-                
-                agent_pw_sc.loc[len(agent_pw_sc)]   = [aid,  a_sc]
-                agent_pw_ext.loc[len(agent_pw_ext)] = [aid,  a_ext]
-                agent_pw_lec.loc[len(agent_pw_lec)] = [aid,  a_lec]
+
                 if aid in res.agents["Agent ID"].values:
                     res.agents.loc[res.agents["Agent ID"] == aid, "Energy sold [kWh]"] = e_kWh
                     res.agents.loc[res.agents["Agent ID"] == aid, "ask price [€/kWh]"] = row["relative Price [€/kWh]"]
@@ -612,8 +602,8 @@ class MarketOptimizer:
         slack_agent_id = self.market_static.slack_agent_id
         
         # Find slack agent in bids and asks
-        slack_bid_idx = next((i for i in m.BIDS if m.id_bid[i] == slack_agent_id), None)
-        slack_ask_idx = next((j for j in m.ASKS if m.id_ask[j] == slack_agent_id), None)
+        slack_bid_idx = self._bid_idx.get(slack_agent_id)
+        slack_ask_idx = self._ask_idx.get(slack_agent_id)
         
         if slack_bid_idx is not None and slack_ask_idx is not None:
             # Energy and price from both bid and ask
@@ -634,6 +624,11 @@ class MarketOptimizer:
         res.agents["Revenue Energy External [€]"] = slack_price * res.agents["Energy External [kWh]"]
         res.agents["Fees and Levies LEC [€]"] = (self.market_static.gridfee_LEC + self.market_static.levies_LEC) / 100 * res.agents["Energy LEC [kWh]"].clip(lower=0)
         res.agents["Fees and Levies External [€]"] = (self.market_static.gridfee_ext + self.market_static.levies_ext) / 100 * res.agents["Energy External [kWh]"].clip(lower=0)
+        # Storage is exempt from grid fees & levies for stored-and-refed energy
+        # (§118(6) EnWG): the end consumer pays the fees when the discharged
+        # energy is finally consumed, so charging storage would double-charge.
+        is_storage = res.agents["Agent Type"] == "storage"
+        res.agents.loc[is_storage, ["Fees and Levies LEC [€]", "Fees and Levies External [€]"]] = 0.0
         
         # Add non LEC agents
         for nd in self.new_non_LEC_data:

@@ -12,13 +12,16 @@ arbitrage MDP can be driven directly from the historical price series. It runs a
 Faithfulness: state (state_features), reward (mark_to_market_reward) and SOC/power
 dynamics (provide_power_kwh / soc_transition) are imported from
 mesa_model/storage_logic.py — the *same* functions the live agent uses — and the
-step/observe ordering mirrors storage.step()/update_status() exactly. Trades are
-charged the same bid-ask spread the live agent crosses (action_to_bid posts
-p±spread), so training sees the real round-trip transaction cost. The one
-remaining simplification is fill *quantity*: we assume the agent always clears its
-requested volume against the grid (close to true, since the live agent bids
-aggressively enough to clear against the price-of-last-resort external grid).
-Validate the trained policy in the full Mesa market before drawing conclusions.
+step/observe ordering mirrors storage.step()/update_status() exactly.
+
+Cost model (fee-exempt storage, §118 EnWG): buys pay p+margin_buy, sells receive
+p−margin_sell — the conservative bracket around the live uniform slack-price
+settlement (slack = p+margin_buy when the LEC imports, p−margin_sell when it
+exports). Live, action_to_bid crosses the LP's fee term so requested volumes
+clear; the remaining simplification here is fill *quantity* (always fills), with
+one live rule mirrored exactly: sells whose ask would fall below ASK_PRICE_FLOOR
+(e.g. negative prices) do NOT fill. Validate the trained policy in the full Mesa
+market before drawing conclusions.
 
 After training, drop the frozen policy into the real agent for evaluation:
     SAC_LOAD_POLICY=output/sac/surrogate_policy.pt SAC_EVAL=1 python main.py
@@ -30,6 +33,7 @@ import numpy as np
 
 from mesa_model.storage_logic import (
     state_features, mark_to_market_reward, provide_power_kwh, soc_transition,
+    ACTION_DEADBAND, ASK_PRICE_FLOOR, STATE_DIM, FORECAST_STEPS,
 )
 
 _EPS = 1e-6
@@ -39,9 +43,8 @@ class StorageArbitrageEnv:
     def __init__(self, prices, timestamps, capacity, max_power_kw, efficiency,
                  discharge_per_step, dt_h, soc_start=0.40, soc_floor=0.20,
                  soc_ceiling=0.85, margin_buy=1.0, margin_sell=0.3,
-                 soc_shaping_weight=1.0, soc_shaping_anneal=100_000.0,
-                 episode_len=96, random_start=True, random_soc=True, seed=42,
-                 spread=0.2):
+                 gamma=0.996, soc_shaping_weight=1.0, soc_shaping_anneal=100_000.0,
+                 episode_len=96, random_start=True, random_soc=True, seed=42):
         self.prices = np.asarray(prices, dtype=float)
         self.timestamps = list(timestamps)
         assert len(self.prices) == len(self.timestamps)
@@ -57,12 +60,9 @@ class StorageArbitrageEnv:
         self.soc_ceiling = soc_ceiling
         self.margin_buy = margin_buy
         self.margin_sell = margin_sell
+        self.gamma = gamma
         self.soc_shaping_weight = soc_shaping_weight
         self.soc_shaping_anneal = soc_shaping_anneal
-        # Bid-ask cost the live agent pays: action_to_bid crosses the market by
-        # `spread` ct/kWh on every buy (p+spread) and sell (p-spread). Charge it
-        # here so training sees the same round-trip cost as the live eval.
-        self.spread = float(spread)
 
         self.episode_len = episode_len
         self.random_start = random_start
@@ -70,7 +70,7 @@ class StorageArbitrageEnv:
         self.rng = np.random.RandomState(seed)
 
         self.ewma_beta = 0.05
-        self.state_dim = 16
+        self.state_dim = STATE_DIM
         self._warmup_window = 96
 
         self.soc = soc_start
@@ -103,6 +103,7 @@ class StorageArbitrageEnv:
             lag_1h=self._lag_1h, lag_4h=self._lag_4h, hourly_ewma=self.hourly_ewma,
             hour=t.hour, weekday=t.weekday(), month=t.month,
             margin_buy=self.margin_buy, margin_sell=self.margin_sell,
+            future_prices=self.prices[idx + 1: idx + 1 + FORECAST_STEPS],
         ), dtype=np.float32)
 
     # -- API ---------------------------------------------------------------
@@ -138,11 +139,17 @@ class StorageArbitrageEnv:
 
         max_sold, max_bought = provide_power_kwh(
             soc_old, self.capacity, self.max_power_kw, self.dt_h, self.efficiency)
+        # Cash-leg prices: the surrogate settlement model (see module docstring).
+        p_buy = p_dec + self.margin_buy
+        p_sell = p_dec - self.margin_sell
+
         bought = sold = 0.0
-        if action > _EPS:
+        if action > ACTION_DEADBAND:
             bought = action * max_bought
-        elif action < -_EPS:
-            sold = -action * max_sold
+        elif action < -ACTION_DEADBAND:
+            # Mirrors action_to_bid: an ask below the floor cannot clear.
+            if p_sell - 0.01 >= ASK_PRICE_FLOOR:
+                sold = -action * max_sold
 
         soc_new = soc_transition(soc_old, bought, sold, self.capacity,
                                  self.efficiency, self.discharge)
@@ -153,19 +160,15 @@ class StorageArbitrageEnv:
         self._observe(t2, p_now)
 
         reward = mark_to_market_reward(
-            bought=bought, sold=sold, p_decision=p_dec, p_now=p_now,
+            bought=bought, sold=sold, p_buy=p_buy, p_sell=p_sell,
+            p_decision=p_dec, p_now=p_now,
             soc_old=soc_old, soc_new=soc_new, capacity=self.capacity,
+            efficiency=self.efficiency, margin_sell=self.margin_sell,
+            gamma=self.gamma,
             soc_floor=self.soc_floor, soc_ceiling=self.soc_ceiling,
             shaping_weight=self.soc_shaping_weight,
             total_env_steps=total_env_steps, shaping_anneal=self.soc_shaping_anneal,
         )
-
-        # Bid-ask cost: buying pays p_dec+spread, selling receives p_dec-spread,
-        # i.e. a cost of (bought+sold)*spread/100 € on top of the mid-price fill
-        # that mark_to_market_reward assumes. Inventory revaluation stays at the
-        # mid price, so only the cashflow leg is charged.
-        spread_cost = (bought + sold) * self.spread / 100.0
-        reward -= spread_cost
 
         self.soc = soc_new
         self.t = t2
@@ -175,6 +178,6 @@ class StorageArbitrageEnv:
         info = {
             "bought": bought, "sold": sold, "p_decision": p_dec, "p_now": p_now,
             "soc": soc_new,
-            "profit_eur": (sold - bought) * p_dec / 100.0 - spread_cost,
+            "profit_eur": (sold * p_sell - bought * p_buy) / 100.0,
         }
         return self._state(t2), float(reward), done, info

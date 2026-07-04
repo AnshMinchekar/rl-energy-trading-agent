@@ -30,21 +30,7 @@ from collections import defaultdict
 from optimization.HN_optimizer import HNOptimizer
 
 
-#---------------------------------------------------------------------------------
-def compute_price(model):
-    "Pricing rule"
-    demand_prices=sorted([model.data["demand"].iloc[a,1] for a in range(0,len(model.data["demand"])) if model.data["demand"].iloc[a,2]>=0.001])
-    supply_prices=sorted([model.data["supply"].iloc[a,1] for a in range(0,len(model.data["supply"])) if model.data["supply"].iloc[a,2]>=0.001])[::-1]
-    
-    market_clearing_price=(demand_prices[0]+supply_prices[0])/2
-    model.data["clearing_price [€/kWh]"]=market_clearing_price
-    return(market_clearing_price)
-
-def step_subnet(subnet, agents):
-    """Step all agents in one subnet sequentially."""
-    for agent in agents:
-        agent.step()           
-#---------------------------------------------------       
+#---------------------------------------------------
 class LEM(mesa.Model):
     "A model with some number of agents."
     def __init__(self, sb_grid, date):
@@ -63,7 +49,9 @@ class LEM(mesa.Model):
         self.total_steps=int((self.end_date-self.start_date)/timedelta(minutes=15))
         self.stepcount=(self.current_date-self.start_date)/timedelta(minutes=15)
         self.temperature_df=config.temperature.loc[:, ["time", "Temperatur-Dortmund"]]
-        self.temperature=float(self.temperature_df.loc[self.temperature_df["time"]==self.current_date+self.timestep].iloc[0,1])
+        # O(1) per-step lookup instead of a full-column scan every step
+        self._temp_by_time=dict(zip(self.temperature_df["time"], self.temperature_df.iloc[:,1]))
+        self.temperature=float(self._temp_by_time[self.current_date+self.timestep])
         self.gridfee_LEC=config.main["gridfee_LEC"]
         self.gridfee_ext=config.main["gridfee_ext"]
         self.levies_LEC=config.main["levies_LEC"]
@@ -202,16 +190,17 @@ class LEM(mesa.Model):
         id_count+=1
         self.grid.ext_grid["type"]="ext. grid"
 
-        "Set up flexible agents" 
+        "Set up flexible agents"
+        # Row 0 of the SimBench storage table IS the learning (SAC) battery at
+        # its real bus; the rest run the optimisation method. No phantom
+        # duplicate unit — the grid holds exactly the storage the dataset defines.
         self.grid.storage["id"]="None"
         for a in range (0,len(self.grid.storage)):
-            if self.grid.storage.loc[a]["bus"]!=4:
-                storage(self, self.grid.storage.loc[a]["max_e_mwh"]*1000, self.grid.storage.loc[a]["p_mw"]*-1000, self.grid.storage.loc[a]["bus"],self.grid.storage.loc[a]["efficiency_percent"], 1-self.grid.storage.loc[a]["self-discharge_percent_per_day"]/100, "optimisation")
-            self.grid.storage.loc[a]["id"]=id_count
+            method = "learning" if a == 0 else "optimisation"
+            storage(self, self.grid.storage.loc[a]["max_e_mwh"]*1000, self.grid.storage.loc[a]["p_mw"]*-1000, self.grid.storage.loc[a]["bus"],self.grid.storage.loc[a]["efficiency_percent"], 1-self.grid.storage.loc[a]["self-discharge_percent_per_day"]/100, method)
+            self.grid.storage.loc[a, "id"]=id_count
             id_count+=1
-        a=0
-        storage(self, self.grid.storage.loc[a]["max_e_mwh"]*1000, self.grid.storage.loc[a]["p_mw"]*-1000, 5,self.grid.storage.loc[a]["efficiency_percent"], 1-self.grid.storage.loc[a]["self-discharge_percent_per_day"]/100, "learning")
-        
+
         for aa in self.grid.load.index:
                 profile_str = self.grid.load.at[aa,"profile"]
                 if profile_str.startswith("Soil") or profile_str.startswith("Air"):
@@ -266,7 +255,7 @@ class LEM(mesa.Model):
         self.market_price_margin_sell=0.3
         self.market_price_margin_charge=[agents.margin_charge for agents in self.agents if agents.flex==2][0]
         self.HEM_dict=self.build_HEM_dict()
-        self.solver="gurobi_direct"
+        self.solver=config.main.get("solver", "gurobi_direct")
 
 
 
@@ -429,6 +418,10 @@ class LEM(mesa.Model):
         agent_data_list = []
 
         for agent in agents:
+            # The SAC battery decides for itself — including it here wastes a
+            # Gurobi schedule per re-plan and biases co-located HN prices.
+            if getattr(agent, "method", None) == "learning":
+                continue
             if agent.flex == 0:  # Unflexible load with power profile
                 agent_data = {
                 'flex': 0, 
@@ -490,8 +483,8 @@ class LEM(mesa.Model):
     def step(self):
         """Advance the model by one step."""
         self.stepcount+=1
-        self.current_date += self.timestep 
-        self.temperature=float(self.temperature_df.loc[self.temperature_df["time"]==self.current_date].iloc[0,1])
+        self.current_date += self.timestep
+        self.temperature=float(self._temp_by_time[self.current_date])
         [a.update_status() for a in self.agents if a.flex in [1,2,3]] 
         self.market_price=[agents.energy_price for agents in self.agents if agents.flex==999][0]
         if self.stepcount==0:
@@ -508,6 +501,8 @@ class LEM(mesa.Model):
                     continue
                 max_prognosis_values = []
                 for agent in agents:
+                    if getattr(agent, "method", None) == "learning":
+                        continue
                     if hasattr(agent, 'max_prognosis'):
                         max_prognosis_values.append(agent.max_prognosis)
                 
@@ -560,6 +555,8 @@ class LEM(mesa.Model):
                 # Build agent states for this bus
                 agent_states = {}
                 for agent in self.HEM_dict[bus]:
+                    if getattr(agent, "method", None) == "learning":
+                        continue
                     if agent.flex == 0:  # Unflexible load
                         agent_states[agent.unique_id] = {}
                     elif agent.flex == 1:  # Battery

@@ -554,9 +554,6 @@ class storage(mesa.Agent):
             self._price_cache_ready = False
 
     def get_future_prices(self, k=FORECAST_STEPS):
-        """Next k known day-ahead prices after the current step (published
-        12-36 h ahead in reality, so reading them is not leakage). Padded by
-        state_features when the series runs out near the simulation end."""
         if not self._price_cache_ready:
             self._initialize_price_cache()
         if not self._price_cache_ready:
@@ -585,12 +582,6 @@ class storage(mesa.Agent):
         return 30.0
 
     def build_state(self):
-        """20-D state vector (see storage_logic.state_features).
-
-        Backward-looking features use only the rolling observed-price buffers
-        populated in update_status; the forward features read the *known*
-        day-ahead prices (public ahead of delivery — legitimate, not leakage).
-        """
         t = self.model.current_date
         return state_features(
             soc=self.soc, soc_floor=self.soc_floor, soc_ceiling=self.soc_ceiling,
@@ -604,21 +595,7 @@ class storage(mesa.Agent):
         )
 
     def action_to_bid(self, action):
-        """Map SAC action ∈ [-1, 1] to a price-taking market bid/ask.
 
-        The agent learns *when* and *how much* to trade; the price is set so
-        the order *strictly* clears in the welfare LP. A bid at exactly
-        p+margin_buy ties the external grid's ask and then LOSES to the
-        gridfee_levies_ext term in the objective, so external buys never
-        cleared (night charging was impossible). The bid therefore crosses
-        margin + external gridfee + levies + ε. Storage is fee-exempt
-        (§118 EnWG) in the settlement accounting, so crossing the fee term is
-        purely a clearing device — the agent still settles at the uniform
-        slack price. Asks undercut p−margin_sell by ε (floored at
-        ASK_PRICE_FLOOR, so sells at negative prices do not clear).
-        A |action| < ACTION_DEADBAND is a deliberate hold — no order.
-        Action sign: +charge, -discharge.
-        """
         self.ask = [0, 0, self.offer_function(0), "lin"]
         self.bid = [0, 0, self.offer_function(0), "lin"]
         self.coefficients_ask = [0, 0]

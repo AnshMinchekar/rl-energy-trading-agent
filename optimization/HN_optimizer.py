@@ -1,4 +1,5 @@
 import gc
+import os
 from pyomo.environ import (
     ConcreteModel, Set, Param, Var, NonNegativeReals, Reals, Binary, 
     Constraint, Objective, minimize, value, SolverFactory, RangeSet, inequality
@@ -13,7 +14,13 @@ class HNOptimizer:
     Simplified version of HEM Optimizer that builds the model once during initialization
     and updates only parameters/bounds in each optimization round.
     """
-    
+
+    # Usable SOC band for batteries. Must match the limits the storage agent enforces
+    # physically in agents.py provide_a_power; if the LP band is narrower it stops
+    # planning (and stops posting an ask) as soon as the real SOC leaves the band.
+    SOC_MIN = 0.05
+    SOC_MAX = 0.95
+
     def __init__(self, agent_data_list, model_params, external_data):
         """
         Initialize the optimizer with static data and build the optimization model once.
@@ -38,6 +45,11 @@ class HNOptimizer:
         self.num_evs = sum(1 for a in self.agent_data if a['flex'] == 2)
         self.num_batteries = sum(1 for a in self.agent_data if a['flex'] == 1)
         self.num_heatpumps = sum(1 for a in self.agent_data if a['flex'] == 3)
+
+        # Agent indices of the batteries, needed by the fee-base decomposition in
+        # _build_base_constraints. Computed here because that runs before
+        # _build_agent_constraints, which is what populates self.battery_indices.
+        self.battery_agent_idx = [ii for ii, a in enumerate(self.agent_data) if a['flex'] == 1]
         
         # External data
         self.margin_buy = external_data['margin_buy']
@@ -61,11 +73,45 @@ class HNOptimizer:
             # Default: use 2 threads per worker to avoid oversubscription
             threads_per_worker = 2
         
-        # Set solver options based on solver type
-        self._configure_solver_options(solver_name, 
-                                       time_limit=60, 
-                                       mip_gap=0.15, 
+        # Set solver options based on solver type.
+        #
+        # mip_gap was 0.15 with time_limit 60. On a node energy cost of EUR 10-50 that
+        # permits EUR 1.5-7.5 of optimality slack, while the entire battery arbitrage
+        # opportunity is a 1-3 ct/kWh spread (a full 146.7 kWh cycle ~ EUR 2.93) -- the
+        # tolerance was wider than the signal being optimised. 0.01 puts the relative
+        # slack an order of magnitude below the spread.
+        #
+        # mip_gap_abs matters at least as much here, because a *relative* gap is
+        # meaningless on a node whose objective sits near zero. Measured on bus 14:
+        # the solver burned the full 300 s time limit and still reported a 28.6% gap
+        # while the absolute slack was EUR 0.010 -- one cent, grinding to certify a
+        # quantity with no economic content.
+        #
+        # 0.05 was tried first and left buses 6 and 12 (slack EUR 0.063 / 0.051) still
+        # timing out just above the floor. 0.15 clears the whole measured spread with
+        # room, and is still negligible against what a solve actually decides: this is
+        # a receding-horizon plan where only the FIRST of 83 steps is executed, so
+        # EUR 0.15 spread over the horizon is well under a cent on the action taken,
+        # versus a per-step trade worth EUR 0.19-0.58.
+        #
+        # time_limit drops 300 -> 60 for the same reason. Once the buy_flag binaries
+        # were gone the incumbent was always within pennies at the point of timeout;
+        # the extra 240 s bought certification, never a better schedule. 60 s bounds
+        # the worst case per bus at a fifth of the cost.
+        self._configure_solver_options(solver_name,
+                                       time_limit=60,
+                                       mip_gap=0.01,
+                                       mip_gap_abs=0.15,
                                        threads=threads_per_worker)
+
+        # Per-solve solver diagnostics (termination condition, gap, wall time).
+        # Written by _log_solve_diagnostics; see self.solve_log_path.
+        # SOLVE_LOG_DIR redirects the whole directory without touching model.py,
+        # so two runs (e.g. an A/B of a formulation change) can be kept apart.
+        self.solve_log_path = external_data.get('solve_log_path')
+        self.solve_log_dir = os.environ.get(
+            'SOLVE_LOG_DIR', os.path.join('output', 'solver_diagnostics'))
+        self._solve_seq = 0
         
         # Build model once
         self.max_horizon= model_params.get('horizon')
@@ -76,16 +122,26 @@ class HNOptimizer:
         
         print(f"HEM Optimizer initialized with {self.num_agents} agents")
     
-    def _configure_solver_options(self, solver_name, time_limit=60, mip_gap=0.15, threads=4):
-        """Configure solver options in a solver-agnostic way"""
+    def _configure_solver_options(self, solver_name, time_limit=60, mip_gap=0.15,
+                                  mip_gap_abs=None, threads=4):
+        """
+        Configure solver options in a solver-agnostic way.
+
+        mip_gap_abs stops the solve once the incumbent is within that many EUR of the
+        bound, regardless of the ratio. It is the meaningful criterion for a node whose
+        objective is near zero, where a relative gap can stay huge over pennies.
+        Solvers that expose no absolute-gap parameter (GLPK, CBC here) simply ignore it.
+        """
         solver_name = solver_name.lower()
-        
+
         if solver_name in ['gurobi', 'gurobi_direct', 'gurobi_persistent']:
             # Gurobi options - optimized for fast feasible solutions
             # (gurobi_direct/_persistent run in-process via gurobipy but accept
             #  the same native parameter names as the legacy shell interface)
             self.solver.options['TimeLimit'] = time_limit
             self.solver.options['MIPGap'] = mip_gap
+            if mip_gap_abs is not None:
+                self.solver.options['MIPGapAbs'] = mip_gap_abs
             self.solver.options['MIPFocus'] = 1  # 1=feasibility, 2=optimality, 3=bound
             self.solver.options['Heuristics'] = 0.3  # Spend 30% time finding good solutions fast
             self.solver.options['Cuts'] = 1  # Moderate cuts (faster than aggressive)
@@ -99,6 +155,8 @@ class HNOptimizer:
             # IBM CPLEX options - optimized for fast feasible solutions
             self.solver.options['timelimit'] = time_limit
             self.solver.options['mip_tolerances_mipgap'] = mip_gap
+            if mip_gap_abs is not None:
+                self.solver.options['mip_tolerances_absmipgap'] = mip_gap_abs
             self.solver.options['emphasis_mip'] = 1  # 1=feasibility, 2=optimality, 3=balanced, 4=hidden
             self.solver.options['mip_strategy_heuristicfreq'] = 10  # Run heuristics more frequently
             self.solver.options['mip_limits_cutpasses'] = 1  # Fewer cut passes (faster)
@@ -126,6 +184,8 @@ class HNOptimizer:
             # HiGHS (open-source) via APPSI interface
             self.solver.options['time_limit'] = time_limit
             self.solver.options['mip_rel_gap'] = mip_gap
+            if mip_gap_abs is not None:
+                self.solver.options['mip_abs_gap'] = mip_gap_abs
             self.solver.options['threads'] = threads
             self.solver.options['output_flag'] = False
 
@@ -173,6 +233,11 @@ class HNOptimizer:
         self.model.power_sell = Var(self.model.AGENTS, self.model.TIME, 
                                    within=NonNegativeReals, bounds=(0, 1000))
         self.model.power_net = Var(self.model.TIME, within=Reals, bounds=(-1000, 1000))
+
+        # Base that grid fees + levies are charged on: the node's external import
+        # EXCLUDING battery charging, which settlement exempts (§118(6) EnWG,
+        # market_optimizer.py is_storage rule). See fee_base_rule.
+        self.model.fee_base = Var(self.model.TIME, within=NonNegativeReals, bounds=(0, 1000))
         
         if self.num_evs > 0:
             self.model.power_out_ev = Var(self.model.EVS, self.model.TIME, 
@@ -184,13 +249,18 @@ class HNOptimizer:
         self.model.stored_en = Var(within=Reals, bounds=(-1e5, 1e4))
         self.model.stored_en_price = Var(within=Reals, bounds=(-1e5, 1e4))
         
-        self.model.A = Var(self.model.TIME, within=NonNegativeReals)
-        self.model.zz = Var(self.model.TIME, within=Binary)
-        self.model.z_mode = Var(self.model.AGENTS, self.model.TIME, within=Binary)
-        
+        # NOTE: Vars `A` (NonNegativeReals), `zz` (Binary) and `z_mode` (Binary per
+        # agent per step) were declared here and deleted 2026-08-17. `A`/`zz` were
+        # constrained by three Big-M rules (A_upper / A_zero / A_lower) but appeared in
+        # no objective and no other constraint; `z_mode` was never referenced at all.
+        # Together they added ~(2 + num_agents) * max_horizon binaries per optimizer,
+        # all of them free to branch on and none of them affecting the solution.
+
         if self.num_batteries > 0:
-            self.model.soc_battery = Var(self.model.BATTERIES, RangeSet(0, self.max_horizon), 
-                                        within=NonNegativeReals, bounds=(0.2, 0.8))
+            # Band matches the physical envelope the storage agent actually enforces in
+            # agents.py provide_a_power (discharge down to 0.05, charge up to 0.95).
+            self.model.soc_battery = Var(self.model.BATTERIES, RangeSet(0, self.max_horizon),
+                                        within=NonNegativeReals, bounds=(self.SOC_MIN, self.SOC_MAX))
         
         if self.num_heatpumps > 0:
             self.model.T_hp = Var(self.model.HEATPUMPS, RangeSet(0, self.max_horizon), 
@@ -202,12 +272,20 @@ class HNOptimizer:
             self.model.soc_ev = Var(self.model.EVS, RangeSet(0, self.max_horizon), 
                                    within=NonNegativeReals, bounds=(0, 10000))
         
-        self.model.buy_flag = Var(self.model.TIME, within=Binary)
-        
-        # Constants
-        self.M = 1e7
-        self.MM = 1e6
-        
+        # NOTE: Var `buy_flag` (Binary per step) was deleted 2026-08-17, and with it
+        # the Big-M constants bigM / bigMM. It selected between the buy-price and
+        # sell-price expression for cost_energy through four Big-M constraints, but
+        # that disjunction was never needed -- the cost function is convex, so its
+        # upper envelope is reachable with two plain inequalities. See the cost_energy
+        # constraints in _build_base_constraints for the argument.
+        #
+        # This was the dominant source of integrality: max_horizon binaries per
+        # optimizer, every one of them with a Big-M so loose the LP relaxation could
+        # satisfy the inactive branch with any fractional flag. Measured before the
+        # change, bus 10's first solve ran the full 300 s time limit and terminated
+        # at a 175% gap. What remains is battery_mode_{k}, num_batteries * horizon
+        # binaries -- and a bus with no battery is now a pure LP.
+
         # Build base constraints
         self._build_base_constraints()
         
@@ -479,92 +557,99 @@ class HNOptimizer:
             return m.stored_en == m.battery_stored + m.hp_stored + m.ev_stored
         self.model.stored_en_constraint = Constraint(rule=stored_en_rule)
         
-        # Stored energy price constraint
+        # Terminal value of the inventory change over the horizon, in EUR.
+        #
+        # stored_en is a delta in kWh and avg_price is in ct/kWh, so the whole product
+        # needs /100 to match cost_energy's units -- the old /10 on the fee block left the
+        # credit ~100x too large (measured: 64.8 kWh credited EUR 90.1, i.e. EUR 1.39/kWh,
+        # against EUR 11.55 of total node energy cost), which was the only thing overcoming
+        # the phantom charging fee and also why the LP refused to discharge once full.
+        #
+        # Fees are dropped from the credit as well: they are a flow cost already paid on
+        # the way in, so charging them again on terminal inventory double-counts.
         def stored_en_price_rule(m):
             n = int(value(m.horizon))
             avg_price = sum(m.prices[t] for t in range(n)) / n if n > 0 else 0
-            return m.stored_en_price == (avg_price + (self.margin_buy + self.levies + self.gridfee)/10) * m.stored_en
+            return m.stored_en_price == avg_price * m.stored_en / 100
         self.model.stored_en_price_constraint = Constraint(rule=stored_en_price_rule)
         
         print(f"Agent constraints built for {len(self.agent_data)} agents")
     
     def _build_base_constraints(self):
         """Build the base constraints that don't depend on specific agent data"""
-        M = self.M
-        MM = self.MM
-        
         # Power balance constraint
         def power_balance_rule(m, t):
             if t >= value(m.horizon):
                 return Constraint.Skip
             return m.power_net[t] == sum(m.power_buy[i, t] for i in m.AGENTS) - sum(m.power_sell[i, t] for i in m.AGENTS)
         self.model.power_balance = Constraint(self.model.TIME, rule=power_balance_rule)
-        
-        # Big-M constraints for A variable
-        def A_upper_rule(m, t):
+
+        # Fee base: max(0, power_net - battery charging).
+        #
+        # power_net bundles household load with battery charging, so charging fees to the
+        # whole of it taxes battery arbitrage at gridfee+levies (~15.7 ct/kWh) that
+        # settlement never actually charges storage. Subtracting battery charging leaves
+        # ordinary household consumption paying full fees, which is correct.
+        #
+        # Only the >= arm of max() is stated: fee_base appears nowhere except the buy
+        # branch of cost_energy, with a positive coefficient, and cost_energy is minimised
+        # -- so the solver drives fee_base down onto max(0, .) on its own. No binary needed.
+        # On sell steps fee_base is free above its lower bound and enters nothing.
+        def fee_base_rule(m, t):
             if t >= value(m.horizon):
                 return Constraint.Skip
-            return m.A[t] <= m.power_net[t] + M * m.zz[t]
-        self.model.A_upper = Constraint(self.model.TIME, rule=A_upper_rule)
-        
-        def A_zero_rule(m, t):
+            batt_charge = sum(m.power_buy[i, t] for i in self.battery_agent_idx)
+            return m.fee_base[t] >= m.power_net[t] - batt_charge
+        self.model.fee_base_con = Constraint(self.model.TIME, rule=fee_base_rule)
+
+        # NOTE: constraints A_upper / A_zero / A_lower were deleted here 2026-08-17
+        # along with the `A` and `zz` variables they governed -- see the note at the
+        # variable declarations. They defined A[t] = max(0, power_net[t]) via Big-M,
+        # but nothing ever read A.
+
+        # Cost of the node's external exchange, as the upper envelope of two lines.
+        #
+        # This replaced a Big-M disjunction on a `buy_flag` binary (four constraints
+        # pinning cost_energy to whichever branch the flag selected, plus two more
+        # defining the flag from the sign of power_net). The binary was unnecessary:
+        # buying costs spot + margin_buy + fees per kWh while selling pays only
+        # spot - margin_sell, so the buy line is strictly the steeper of the two and
+        # the cost function is convex. Under a minimised objective, two >= inequalities
+        # drive cost_energy to exactly max(buy, sell), which is the true cost:
+        #
+        #   power_net > 0 -> buy - sell = conv*(power_net*(margin_buy + margin_sell)
+        #                    + fee_base*(levies + gridfee))/100 > 0, so buy wins.
+        #   power_net < 0 -> nothing pushes fee_base up (it enters only here, with a
+        #                    positive coefficient, under minimisation), so it falls to
+        #                    its floor of max(0, power_net - battery charge) = 0,
+        #                    leaving buy - sell = conv*power_net*1.3/100 < 0: sell wins.
+        #
+        # Exact, not a relaxation -- and it makes the LP relaxation exact too, where
+        # the Big-M version left it nearly vacuous.
+        #
+        # Energy price applies to the full node exchange; fees only to the fee base
+        # (node import net of battery charging, which settlement exempts).
+        def _formula_buy(m, t):
+            conv = self.sref / (3600 / self.timestep.seconds)
+            return conv * (m.power_net[t] * (m.prices[t] + self.margin_buy) / 100
+                           + m.fee_base[t] * (self.levies + self.gridfee) / 100)
+
+        def _formula_sell(m, t):
+            conv = self.sref / (3600 / self.timestep.seconds)
+            return conv * m.power_net[t] * (m.prices[t] - self.margin_sell) / 100
+
+        def cost_buy_rule(m, t):
             if t >= value(m.horizon):
                 return Constraint.Skip
-            return m.A[t] <= M * (1 - m.zz[t])
-        self.model.A_zero = Constraint(self.model.TIME, rule=A_zero_rule)
-        
-        def A_lower_rule(m, t):
+            return m.cost_energy[t] >= _formula_buy(m, t)
+        self.model.cost_buy = Constraint(self.model.TIME, rule=cost_buy_rule)
+
+        def cost_sell_rule(m, t):
             if t >= value(m.horizon):
                 return Constraint.Skip
-            return m.A[t] >= m.power_net[t]
-        self.model.A_lower = Constraint(self.model.TIME, rule=A_lower_rule)
-        
-        # Buy/sell flag constraints
-        def buy_flag_upper_rule(m, t):
-            if t >= value(m.horizon):
-                return Constraint.Skip
-            return m.power_net[t] <= MM * m.buy_flag[t]
-        self.model.buy_flag_upper = Constraint(self.model.TIME, rule=buy_flag_upper_rule)
-        
-        def buy_flag_lower_rule(m, t):
-            if t >= value(m.horizon):
-                return Constraint.Skip
-            return m.power_net[t] >= -MM * (1 - m.buy_flag[t])
-        self.model.buy_flag_lower = Constraint(self.model.TIME, rule=buy_flag_lower_rule)
-        
-        # Cost energy constraints (Big-M formulation)
-        def cost_buy_upper_rule(m, t):
-            if t >= value(m.horizon):
-                return Constraint.Skip
-            formula_buy = (m.power_net[t] / (3600 / self.timestep.seconds) * self.sref * 
-                          (m.prices[t] + self.margin_buy + self.levies + self.gridfee) / 100)
-            return m.cost_energy[t] - formula_buy <= M * (1 - m.buy_flag[t])
-        self.model.cost_buy_upper = Constraint(self.model.TIME, rule=cost_buy_upper_rule)
-        
-        def cost_buy_lower_rule(m, t):
-            if t >= value(m.horizon):
-                return Constraint.Skip
-            formula_buy = (m.power_net[t] / (3600 / self.timestep.seconds) * self.sref * 
-                          (m.prices[t] + self.margin_buy + self.levies + self.gridfee) / 100)
-            return m.cost_energy[t] - formula_buy >= -M * (1 - m.buy_flag[t])
-        self.model.cost_buy_lower = Constraint(self.model.TIME, rule=cost_buy_lower_rule)
-        
-        def cost_sell_upper_rule(m, t):
-            if t >= value(m.horizon):
-                return Constraint.Skip
-            formula_sell = (m.power_net[t] * (m.prices[t] - self.margin_sell) / 
-                           (3600 / self.timestep.seconds) * self.sref / 100)
-            return m.cost_energy[t] - formula_sell <= M * m.buy_flag[t]
-        self.model.cost_sell_upper = Constraint(self.model.TIME, rule=cost_sell_upper_rule)
-        
-        def cost_sell_lower_rule(m, t):
-            if t >= value(m.horizon):
-                return Constraint.Skip
-            formula_sell = (m.power_net[t] * (m.prices[t] - self.margin_sell) / 
-                           (3600 / self.timestep.seconds) * self.sref / 100)
-            return m.cost_energy[t] - formula_sell >= -M * m.buy_flag[t]
-        self.model.cost_sell_lower = Constraint(self.model.TIME, rule=cost_sell_lower_rule)
-        
+            return m.cost_energy[t] >= _formula_sell(m, t)
+        self.model.cost_sell = Constraint(self.model.TIME, rule=cost_sell_rule)
+
         # External charging cost constraint
         def cost_charge_ext_rule(m, t):
             if t >= value(m.horizon):
@@ -576,7 +661,163 @@ class HNOptimizer:
             return (m.cost_charge_ext[t] == ev_power_sum / (3600 / self.timestep.seconds) * 
                     self.sref * (m.prices[t] + self.margin_charge + self.gridfee + self.levies) / 100)
         self.model.cost_charge_ext_con = Constraint(self.model.TIME, rule=cost_charge_ext_rule)
-    
+
+    def _update_variable_bounds(self, n):
+        """
+        Tighten fee_base and cost_energy to the range this step can actually reach.
+
+        This began as Big-M tightening (M=1e7 / MM=1e6 stood against variables bounded
+        +/-1000 pu, four orders of magnitude looser than the model can reach). The
+        Big-M constants are gone now -- the buy_flag disjunction they served was
+        replaced by the convex two-inequality form -- but the bound arithmetic is still
+        worth doing: both variables were declared with boxes far wider than anything
+        reachable, and cost_energy's asymmetric (-1e5, 1e3) box could actually bind.
+
+        Every bound set here dominates the widest value the variable can take given the
+        current step's power bounds, so no feasible schedule is cut off. SAFETY is
+        slack against float error only.
+        """
+        SAFETY = 1.05
+        conv = self.sref / (3600 / self.timestep.seconds)
+        # Declared bound on power_buy / power_sell / power_net; nothing can exceed it.
+        DECLARED_P_UB = 1000.0
+
+        def _var_ub(v):
+            """Largest value v can take right now: its fixed value, or its upper bound."""
+            if v.is_fixed():
+                return abs(value(v))
+            return DECLARED_P_UB if v.ub is None else v.ub
+
+        # Widest absolute price over the horizon, so the cost bound holds through
+        # negative-price hours and Q1 spikes alike.
+        price_abs_max = max((abs(value(self.model.prices[t])) for t in range(n)),
+                            default=0.0)
+
+        fee_rate = self.levies + self.gridfee
+
+        for t in range(n):
+            buy_ub = min(DECLARED_P_UB,
+                         sum(_var_ub(self.model.power_buy[i, t]) for i in range(self.num_agents)))
+            sell_ub = min(DECLARED_P_UB,
+                          sum(_var_ub(self.model.power_sell[i, t]) for i in range(self.num_agents)))
+
+            # fee_base[t] only ever needs to reach max(0, power_net[t] - battery charge),
+            # and power_net[t] <= buy_ub. Its declared ub of 1000 left it free to float
+            # far above that.
+            self.model.fee_base[t].setub(buy_ub)
+
+            # cost_energy[t] settles on max(buy, sell); both formulas take power_net,
+            # which lies in [-sell_ub, buy_ub], so each uses the wider of the two --
+            # not buy_ub, which would under-bound a node whose PV export exceeds its
+            # peak import. Their sum dominates either one.
+            net_abs = max(buy_ub, sell_ub)
+            f_buy = conv * (net_abs * (price_abs_max + self.margin_buy)
+                            + buy_ub * fee_rate) / 100
+            f_sell = conv * net_abs * (price_abs_max + self.margin_sell) / 100
+            cost_bound = (f_buy + f_sell) * SAFETY
+
+            # The declared (-1e5, 1e3) box was asymmetric, and the +1e3 ub could
+            # actually bind on a high-price import step, silently truncating the cost
+            # it is meant to equal.
+            self.model.cost_energy[t].setlb(-cost_bound)
+            self.model.cost_energy[t].setub(cost_bound)
+
+        # Steps past the horizon are skipped by every constraint and absent from the
+        # objective, but reset them so a later longer horizon does not inherit a bound.
+        for t in range(n, self.max_horizon):
+            self.model.fee_base[t].setub(DECLARED_P_UB)
+
+    def _log_solve_diagnostics(self, result, n, solve_seconds):
+        """
+        Append one JSON line per solve: termination condition, objective, best bound,
+        realised MIP gap, wall time.
+
+        Solver output is suppressed (OutputFlag 0), so before this the only evidence
+        about solve quality was wall-clock inference across a whole run. The realised
+        gap is the number that decides whether the schedule is trustworthy: a solve
+        that stops at the time limit with a gap of the same order as the arbitrage
+        spread has returned a near-arbitrary schedule, not an optimal one.
+        """
+        import json, os
+        from pyomo.opt import TerminationCondition
+
+        self._solve_seq += 1
+
+        def _num(x):
+            try:
+                x = float(x)
+            except (TypeError, ValueError):
+                return None
+            return x if abs(x) < 1e29 else None  # Pyomo's +/-inf placeholders
+
+        def fmt_num(x):
+            return "n/a" if x is None else f"{x:.3f}"
+
+        tc = str(result.solver.termination_condition)
+        lb = _num(getattr(result.problem, 'lower_bound', None))
+        ub = _num(getattr(result.problem, 'upper_bound', None))
+
+        gap = None
+        if lb is not None and ub is not None:
+            gap = abs(ub - lb) / max(abs(ub), 1e-9)
+
+        record = {
+            'seq': self._solve_seq,
+            # self.bus comes from the network dataframe as a numpy int64, which
+            # json.dumps refuses; int() it here rather than reaching for a custom
+            # encoder, since every other field is already a plain scalar or str.
+            'bus': int(self.bus),
+            'date': str(self.current_date),
+            'horizon': n,
+            'termination': tc,
+            'status': str(result.solver.status),
+            'objective': ub,
+            'best_bound': lb,
+            'mip_gap': gap,
+            'wall_seconds': round(solve_seconds, 3),
+            # Binaries left in the model. buy_flag is gone, so this is
+            # num_batteries * horizon -- 0 for a bus with no battery, which is a
+            # pure LP. Recorded to correlate solve time against integrality.
+            'n_binaries': self.num_batteries * n,
+        }
+
+        # Loud on stdout only when the solve is suspect -- otherwise this fires on
+        # every step of a multi-thousand-step run and buries the sim's own output.
+        # "Suspect" is judged on absolute slack, not the ratio: a node with a near-zero
+        # objective can sit at a 28% relative gap over one cent, which is not worth a
+        # line of output, while EUR 1 of slack matters even at a tiny ratio.
+        target_gap, target_gap_abs = 0.01, 0.15
+        slack = None if (ub is None or lb is None) else abs(ub - lb)
+        suspect = (result.solver.termination_condition != TerminationCondition.optimal
+                   and (slack is None or slack > target_gap_abs * 1.5))
+        suspect = suspect or (gap is not None and gap > target_gap * 1.5
+                              and slack is not None and slack > target_gap_abs * 1.5)
+        if suspect and tc != str(TerminationCondition.infeasible):
+            gap_str = f"{gap:.4f}" if gap is not None else "n/a"
+            # Print the absolute objective and bound alongside the ratio: a relative
+            # gap is meaningless when the objective sits near zero, and what decides
+            # whether the schedule is trustworthy is the slack in EUR against a
+            # ~EUR 1.5-4.4 arbitrage cycle.
+            print(f"[solver] bus {int(self.bus)} step {self._solve_seq} {self.current_date}: "
+                  f"{tc}, gap={gap_str}, obj={fmt_num(ub)}, bound={fmt_num(lb)}, "
+                  f"slack={fmt_num(slack)} EUR, {solve_seconds:.1f}s")
+
+        path = self.solve_log_path
+        if path is None:
+            # One file per bus: buses may be solved by separate MPI workers, and
+            # interleaved appends from several processes would corrupt the log.
+            path = os.path.join(self.solve_log_dir, f'bus_{int(self.bus)}.jsonl')
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'a', encoding='utf-8') as fh:
+                fh.write(json.dumps(record, default=str) + '\n')
+        except Exception as exc:
+            # Diagnostics must never take down a multi-hour run. Deliberately broad:
+            # an OSError-only guard let a numpy int64 in `bus` kill the first run
+            # through json.dumps, 5 minutes of solve time after the solve succeeded.
+            if self._solve_seq == 1:
+                print(f"[solver] could not write solve log to {path}: {exc!r}")
+
     def optimize(self, variable_data):
         """
         Optimize with current variable data by updating model parameters
@@ -606,10 +847,18 @@ class HNOptimizer:
         
         # Handle unflexible agent power profiles (these need to be updated each round)
         self._update_unflexible_profiles(self.current_date, n)
-        
+
+        # Tighten fee_base / cost_energy against the bounds this step actually has.
+        # Must run last: it reads the power bounds the two updates above just set.
+        self._update_variable_bounds(n)
+
         # Solve
+        import time as _time
+        _t0 = _time.perf_counter()
         result = self.solver.solve(self.model, tee=False)
-        
+        solve_seconds = _time.perf_counter() - _t0
+        self._log_solve_diagnostics(result, n, solve_seconds)
+
         # Cleanup Gurobi resources to prevent file handle leak
         if hasattr(self.solver, '_solver_model') and self.solver._solver_model is not None:
             try:
@@ -715,7 +964,7 @@ class HNOptimizer:
                     agent_data = [a for a in self.agent_data if a['flex'] == 1][batt_idx]
                     print(f"\nBattery {batt_idx} (ID: {agent_data['unique_id']}):")
                     print(f"  Initial SOC: {value(self.model.battery_init_soc[batt_idx]):.2f}")
-                    print(f"  SOC bounds: [0.2, 0.8]")
+                    print(f"  SOC bounds: [{self.SOC_MIN}, {self.SOC_MAX}]")
                     print(f"  Max power: {agent_data['max_power']:.0f} W")
                     print(f"  Capacity: {agent_data['capacity']:.0f} Wh")
             
@@ -840,7 +1089,7 @@ class HNOptimizer:
             
             if agent_data['flex'] == 1:  # Battery
                 battery_idx = unique_id_to_battery_idx[unique_id]
-                current_soc = clamp(state['soc'], 0.2, 0.8)
+                current_soc = clamp(state['soc'], self.SOC_MIN, self.SOC_MAX)
                 self.model.battery_init_soc[battery_idx].set_value(current_soc)
             
             elif agent_data['flex'] == 2:  # EV
@@ -1157,7 +1406,12 @@ class HNOptimizer:
                             if abs(power_vector_buy[i, counter]) > 0.00001:
                                     buy_price[counter] = price_data.iloc[counter]+self.gridfee+self.levies+self.margin_buy-0.3
                             if abs(power_vector_sell[i, counter]) > 0.00001:
-                                    sell_price[counter] = price_data.iloc[counter]+self.gridfee+self.levies+self.margin_buy-0.5
+                                    # Was spot+gridfee+levies+margin_buy-0.5 (= spot+16.2), the bid
+                                    # line above with the variable name swapped. An ask is only a
+                                    # willingness-to-sell threshold -- settlement pays every seller
+                                    # the slack price -- so a fee-inflated ask never clears. Matches
+                                    # the power_vector != 0 branch below.
+                                    sell_price[counter] = price_data.iloc[counter] -self.margin_sell-0.1
                         if power_vector[counter]!=0:
                             if abs(power_vector_sell[i, counter]) > 0.00001:
                                     sell_price[counter] = price_data.iloc[counter] -self.margin_sell-0.1
@@ -1197,18 +1451,17 @@ class HNOptimizer:
                     }
                 
                 if agent_data['flex'] == 1:  # Battery
-                    internal_trade = buy_price[(buy_price==0) & (sell_price==np.inf)]
-                    if len(internal_trade) > 0:
-                        buy_int_price= min(price_data)+self.gridfee_LEC+self.levies_LEC+self.margin_buy
-                        sell_int_price=max(price_data)-self.margin_sell  
-                        if buy_int_price<sell_int_price:
-                            margin=(sell_int_price-buy_int_price)/4
-                            buy_price[(buy_price==0) & (sell_price==np.inf)]=buy_int_price+margin
-                            sell_price[(buy_price==buy_int_price+margin) & (sell_price==np.inf)]=sell_int_price-margin
-                    internal_trade = buy_price[(buy_price==0) & (sell_price==np.inf)]
-                    if len(internal_trade) > 0:
-                        buy_int=price_data[(buy_price==0) & (sell_price==np.inf)]+self.gridfee_LEC+self.levies_LEC+self.margin_buy+0.1
-                        buy_price[(buy_price==0) & (sell_price==np.inf)]=buy_int
+                    # No fallback bid/ask on steps where the LP planned neither charge nor
+                    # discharge: buy_price stays 0 and sell_price stays inf, which agents.py
+                    # reads as "post nothing" for the bid and the ask respectively.
+                    #
+                    # The removed fallback priced idle-step bids at gridfee_LEC+levies_LEC
+                    # (spot+8.95), below the 15.7 ct/kWh the market welfare objective charges
+                    # on external imports, so it could only ever clear against local PV.
+                    # Repricing it to the external fees is NOT the fix -- it fires on every
+                    # idle step, so the battery would bid above market continuously and charge
+                    # to full regardless of price. The LP's plan is the signal; the plan-driven
+                    # bids above already cross the fee hurdle deliberately.
                     agent_results[agent_id] = {
                         'max_buy_price': buy_price
                     }

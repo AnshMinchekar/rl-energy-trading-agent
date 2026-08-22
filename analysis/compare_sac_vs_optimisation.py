@@ -1,10 +1,15 @@
-"""Compare the SAC battery against the HNOptimizer 'optimisation' method on
-the same physical unit (storage row 0, bus 12) over the same window.
+"""Compare the SAC battery against an optimisation baseline on the same
+physical unit (storage row 0, bus 12) over the same window.
+
+Baselines (--baseline, default 'optimisation' for back-compat):
+  * optimisation — the whole-node HNOptimizer/LP path (rows 1-4's method)
+  * arbitrage    — the battery-only level-field LP with SAC's information
+                   set and objective (optimization/arbitrage_optimizer.py)
 
 Inputs are the two logs written by analysis/run_comparison_eval.py:
 
     output/comparison/eval_sac.jsonl
-    output/comparison/eval_optimisation.jsonl
+    output/comparison/eval_<baseline>.jsonl
 
 Outputs:
   * output/comparison/sac_vs_optimisation.png — per-day profit / SOC / trades
@@ -28,8 +33,9 @@ The historical fee-handicap (phantom 16.7 ct/kWh charging tax in the LP
 objective) was fixed 2026-08-16.
 
 Usage:
-    python analysis/compare_sac_vs_optimisation.py
+    python analysis/compare_sac_vs_optimisation.py [--baseline arbitrage]
 """
+import argparse
 import json
 import os
 import sys
@@ -43,15 +49,13 @@ import matplotlib.pyplot as plt
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(REPO_ROOT)
 
-RUNS = [("SAC", "output/comparison/eval_sac.jsonl", "C0"),
-        ("optimisation", "output/comparison/eval_optimisation.jsonl", "C1")]
 SUCCESS_CRITERION = 0.75
 
 
 def load(path):
     if not os.path.exists(path):
         sys.exit(f"Missing {path} — run analysis/run_comparison_eval.py first "
-                 f"(both --mode sac and --mode optimisation).")
+                 f"(--mode sac and the baseline mode).")
     meta, days, summaries = None, [], {}
     with open(path) as f:
         for line in f:
@@ -82,14 +86,23 @@ def rolling(y, w=7):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--baseline", choices=["optimisation", "arbitrage"],
+                    default="optimisation",
+                    help="which eval_<baseline>.jsonl to compare SAC against "
+                         "(default: %(default)s)")
+    baseline = ap.parse_args().baseline
+    runs = [("SAC", "output/comparison/eval_sac.jsonl", "C0"),
+            (baseline, f"output/comparison/eval_{baseline}.jsonl", "C1")]
+
     data = {}
-    for name, path, color in RUNS:
+    for name, path, color in runs:
         meta, days, summaries = load(path)
         data[name] = {"meta": meta, "days": days, "summaries": summaries,
                       "color": color}
 
     id0 = data["SAC"]["meta"]["storage0_id"]
-    if data["optimisation"]["meta"]["storage0_id"] != id0:
+    if data[baseline]["meta"]["storage0_id"] != id0:
         sys.exit("storage0_id differs between the two runs — different grid?")
 
     # --- Provenance guard ----------------------------------------------------
@@ -98,7 +111,7 @@ def main():
     # failure produced the invalid 2026-08 comparison: eval_sac.jsonl predated
     # the five LP fixes by a week and its per-agent margins were off by up to
     # 5x while the aggregate cancelled to +0.9%).
-    shas = {name: data[name]["meta"].get("git_sha") for name, _, _ in RUNS}
+    shas = {name: data[name]["meta"].get("git_sha") for name, _, _ in runs}
     for name, sha in shas.items():
         if sha is None:
             sys.exit(f"The {name} run has no git_sha in its meta record — it "
@@ -108,29 +121,31 @@ def main():
             sys.exit(f"The {name} run was made from a dirty working tree "
                      f"({sha[:10]}+local edits) — commit first and re-run so "
                      f"the comparison is reproducible.")
-    if shas["SAC"] != shas["optimisation"]:
+    if shas["SAC"] != shas[baseline]:
         sys.exit(f"The two runs come from different commits "
-                 f"(SAC {shas['SAC'][:10]} vs optimisation "
-                 f"{shas['optimisation'][:10]}) — rows 1-4 ran different "
+                 f"(SAC {shas['SAC'][:10]} vs {baseline} "
+                 f"{shas[baseline][:10]}) — rows 1-4 ran different "
                  f"optimizer code, so no cross-run number is meaningful. "
                  f"Re-run the stale side on the current commit.")
     print(f"Provenance OK: both runs from commit {shas['SAC'][:10]}, clean tree.")
 
     # --- Window guard --------------------------------------------------------
-    n_days = {name: len(series(data[name]["days"], id0)[1]) for name, _, _ in RUNS}
-    if n_days["SAC"] != n_days["optimisation"]:
+    n_days = {name: len(series(data[name]["days"], id0)[1]) for name, _, _ in runs}
+    if n_days["SAC"] != n_days[baseline]:
         print(f"WARNING: window mismatch — SAC has {n_days['SAC']} day records "
-              f"for row 0, optimisation has {n_days['optimisation']}. Totals "
+              f"for row 0, {baseline} has {n_days[baseline]}. Totals "
               f"and the ratio below are NOT comparable; margins (ct/kWh) are "
               f"the only defensible cross-run numbers, and only on the "
               f"overlapping days.")
 
     # --- Plot: per-day profit / SOC / trades for the row-0 battery ----------
     fig, axes = plt.subplots(1, 3, figsize=(19, 5.8))
-    fig.suptitle("Storage row 0 (bus 12): SAC vs HNOptimizer 'optimisation', "
-                 "same window", fontsize=15, fontweight="bold")
+    baseline_label = ("HNOptimizer 'optimisation'" if baseline == "optimisation"
+                      else "arbitrage-only LP")
+    fig.suptitle(f"Storage row 0 (bus 12): SAC vs {baseline_label}, "
+                 f"same window", fontsize=15, fontweight="bold")
 
-    for name, _, _ in RUNS:
+    for name, _, _ in runs:
         d = data[name]
         dates, rows = series(d["days"], id0)
         if not rows:
@@ -169,7 +184,7 @@ def main():
         ax.tick_params(axis="x", rotation=30)
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
-    out_png = "output/comparison/sac_vs_optimisation.png"
+    out_png = f"output/comparison/sac_vs_{baseline}.png"
     fig.savefig(out_png, dpi=130)
     print(f"Saved {out_png}\n")
 
@@ -181,7 +196,7 @@ def main():
     print(f"{'':16s}{'days':>6s}{'profit EUR':>12s}{'sold kWh':>10s}"
           f"{'ct/kWh':>8s}{'term. SOC':>11s}{'liq. EUR':>10s}{'adjusted EUR':>14s}")
     adjusted = {}
-    for name, _, _ in RUNS:
+    for name, _, _ in runs:
         d = data[name]
         _, rows = series(d["days"], id0)
         total = sum(r["actual_profit_eur"] for r in rows)
@@ -194,16 +209,16 @@ def main():
               f"{margin:8.3f}{s.get('terminal_soc', float('nan')):11.3f}"
               f"{liq:10.2f}{adjusted[name]:14.2f}")
 
-    opt = adjusted["optimisation"]
+    opt = adjusted[baseline]
     sac = adjusted["SAC"]
     print()
     if opt > 1.0:
         ratio = sac / opt
         verdict = "MET" if ratio >= SUCCESS_CRITERION else "NOT met"
-        print(f"SAC / optimisation (terminal-SOC-adjusted): {ratio:.1%} "
+        print(f"SAC / {baseline} (terminal-SOC-adjusted): {ratio:.1%} "
               f"-> >{SUCCESS_CRITERION:.0%} criterion {verdict}")
     else:
-        print(f"optimisation adjusted profit is {opt:+.2f} EUR (near zero or "
+        print(f"{baseline} adjusted profit is {opt:+.2f} EUR (near zero or "
               f"negative) — the ratio criterion is not meaningful; compare "
               f"absolute profits above. Note the fee-handicap caveat in the "
               f"plan file.")
@@ -215,30 +230,30 @@ def main():
     print("\nCross-run sanity check — always-'optimisation' units "
           "(totals AND margins should nearly match):")
     print(f"{'':4s}{'agent':>6s}{'bus':>5s}{'SAC-run EUR':>13s}"
-          f"{'opt-run EUR':>13s}{'diff':>9s}"
-          f"{'SAC ct/kWh':>12s}{'opt ct/kWh':>12s}")
+          f"{'base-run EUR':>13s}{'diff':>9s}"
+          f"{'SAC ct/kWh':>12s}{'base ct/kWh':>12s}")
     worst = 0.0
     for st in data["SAC"]["meta"]["storages"]:
         aid = st["agent_id"]
         if aid == id0:
             continue
         t, mg = {}, {}
-        for name, _, _ in RUNS:
+        for name, _, _ in runs:
             _, rows = series(data[name]["days"], aid)
             t[name] = sum(r["actual_profit_eur"] for r in rows)
             sold = sum(r["energy_sold_kwh"] for r in rows)
             mg[name] = t[name] / sold * 100 if sold else float("nan")
-        diff = t["SAC"] - t["optimisation"]
-        denom = max(abs(t["optimisation"]), 1.0)
+        diff = t["SAC"] - t[baseline]
+        denom = max(abs(t[baseline]), 1.0)
         worst = max(worst, abs(diff) / denom)
         # Margin divergence, floored at 0.5 ct/kWh so near-zero margins don't
         # explode the ratio.
-        if np.isfinite(mg["SAC"]) and np.isfinite(mg["optimisation"]):
-            m_denom = max(abs(mg["optimisation"]), 0.5)
-            worst = max(worst, abs(mg["SAC"] - mg["optimisation"]) / m_denom)
+        if np.isfinite(mg["SAC"]) and np.isfinite(mg[baseline]):
+            m_denom = max(abs(mg[baseline]), 0.5)
+            worst = max(worst, abs(mg["SAC"] - mg[baseline]) / m_denom)
         print(f"    {aid:6d}{st['bus']:5d}{t['SAC']:13.2f}"
-              f"{t['optimisation']:13.2f}{diff:+9.2f}"
-              f"{mg['SAC']:12.3f}{mg['optimisation']:12.3f}")
+              f"{t[baseline]:13.2f}{diff:+9.2f}"
+              f"{mg['SAC']:12.3f}{mg[baseline]:12.3f}")
     if worst > 0.10:
         print(f"  WARNING: up to {worst:.0%} divergence (worst of per-agent "
               f"profit and margin) — the two runs' market outcomes differ "

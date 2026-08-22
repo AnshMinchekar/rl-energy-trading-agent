@@ -1,10 +1,17 @@
 """Run one side of the SAC-vs-optimisation head-to-head over config.yaml's window.
 
-Two modes, both a single pass over the live Mesa/Gurobi market:
+Three modes, each a single pass over the live Mesa/Gurobi market:
 
     python analysis/run_comparison_eval.py --mode optimisation
         Routes storage row 0 (the SAC battery's bus/physics) through the same
         HNOptimizer/LP path as rows 1-4 (via STORAGE0_METHOD=optimisation).
+
+    python analysis/run_comparison_eval.py --mode arbitrage
+        Battery-only level-field LP baseline (STORAGE0_METHOD=arbitrage):
+        plans row 0 over exactly SAC's information set (current price + the
+        known DA forward window) maximising SAC's reward objective, and bids
+        through the same action_to_bid pipeline. See
+        optimization/arbitrage_optimizer.py.
 
     python analysis/run_comparison_eval.py --mode sac
         Frozen-policy SAC evaluation (SAC_EVAL=1, deterministic, no learning),
@@ -62,7 +69,8 @@ def git_provenance():
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--mode", choices=["optimisation", "sac"], required=True)
+    p.add_argument("--mode", choices=["optimisation", "arbitrage", "sac"],
+                   required=True)
     p.add_argument("--policy", default="output/sac/surrogate_policy.pt",
                    help="checkpoint for --mode sac (default: %(default)s)")
     p.add_argument("--max-steps", type=int, default=None,
@@ -75,8 +83,8 @@ def main():
 
     # Env vars must be set BEFORE importing mesa_model.model (it builds the
     # LEM, and therefore the storage agents, at import time).
-    if args.mode == "optimisation":
-        os.environ["STORAGE0_METHOD"] = "optimisation"
+    if args.mode in ("optimisation", "arbitrage"):
+        os.environ["STORAGE0_METHOD"] = args.mode
     else:
         if not os.path.exists(args.policy):
             sys.exit(f"Policy checkpoint not found: {args.policy} "

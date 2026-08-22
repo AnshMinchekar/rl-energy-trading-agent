@@ -20,9 +20,10 @@ warnings.simplefilter("ignore", category=FutureWarning)
 import gc
 from mesa_model.sac import SACLearner
 from mesa_model.storage_logic import (
-    state_features, mark_to_market_reward,
+    state_features, mark_to_market_reward, provide_power_kwh,
     ACTION_DEADBAND, ASK_PRICE_FLOOR, STATE_DIM, FORECAST_STEPS,
 )
+from optimization.arbitrage_optimizer import plan_arbitrage
 
 def initialize(self, typ, factor, cosphi, bus):
     self.typ=typ
@@ -434,7 +435,13 @@ class storage(mesa.Agent):
         self.optimal_power_buy = 0
         self.optimal_power_sell = 0
         self.LEC_participation = True
-        
+
+        # DA price cache backing get_current_price/get_future_prices — needed
+        # by both the "learning" and "arbitrage" methods, so lives here.
+        self._price_index = None
+        self._price_array = None
+        self._price_cache_ready = False
+
         # Initialize bid/ask and coefficients
         self.ask = 0
         self.bid = 0
@@ -512,10 +519,8 @@ class storage(mesa.Agent):
         self.soc_target = 0.50
         self.soc_history = []
 
-        # Price caches / observed-history buffers (no future leakage)
-        self._price_index = None
-        self._price_array = None
-        self._price_cache_ready = False
+        # Observed-history buffers (no future leakage); the DA price cache
+        # itself is initialised in __init__ (shared with "arbitrage").
         self.price_history = deque(maxlen=96)          # last 24 h of observed prices
         self._price_lag_1h = deque(maxlen=4)           # 4 × 15 min = 1 h
         self._price_lag_4h = deque(maxlen=16)          # 16 × 15 min = 4 h
@@ -904,7 +909,35 @@ class storage(mesa.Agent):
                 self.last_override_active = override
 
                 self.action_to_bid(action)
-        
+
+            elif self.method == "arbitrage":
+                # Level-field LP baseline: plan over exactly SAC's price
+                # information (current price + known DA forward window),
+                # maximise SAC's reward objective, act through the same
+                # action_to_bid() pipeline (deadband, emergency overrides,
+                # fee-crossing bid price). See optimization/arbitrage_optimizer.
+                dt_h = self.model.timestep.seconds / 3600.0
+                prices = [self.get_current_price()] + list(self.get_future_prices())
+                buy_kwh, sell_kwh = plan_arbitrage(
+                    soc=self.soc, prices=prices, capacity=self.capacity,
+                    max_power_kw=self.max_power, dt_h=dt_h,
+                    efficiency=self.efficiency, discharge=self.discharge,
+                    margin_buy=getattr(self.model, "market_price_margin_buy", 1.0),
+                    margin_sell=getattr(self.model, "market_price_margin_sell", 0.3),
+                )
+                # Grid-side kWh -> the same action fraction in [-1, 1] SAC
+                # emits: the share of this step's max charge / discharge.
+                max_sold_kwh, max_bought_kwh = provide_power_kwh(
+                    self.soc, self.capacity, self.max_power, dt_h, self.efficiency)
+                eps = 1e-9
+                if buy_kwh > eps and buy_kwh >= sell_kwh and max_bought_kwh > eps:
+                    action = min(buy_kwh / max_bought_kwh, 1.0)
+                elif sell_kwh > eps and max_sold_kwh > eps:
+                    action = -min(sell_kwh / max_sold_kwh, 1.0)
+                else:
+                    action = 0.0
+                self.action_to_bid(action)
+
         else:  # Non-LEC participation
             self.optimal_power_buy_current = np.clip(
                 self.optimal_power_buy[self.updated], 0, self.max_power_charge

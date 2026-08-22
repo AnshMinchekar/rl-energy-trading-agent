@@ -195,11 +195,14 @@ class LEM(mesa.Model):
         # its real bus; the rest run the optimisation method. No phantom
         # duplicate unit — the grid holds exactly the storage the dataset defines.
         # STORAGE0_METHOD=optimisation routes row 0 through the same
-        # HNOptimizer/LP path as rows 1-4 (SAC-vs-optimisation benchmark).
+        # HNOptimizer/LP path as rows 1-4 (SAC-vs-optimisation benchmark);
+        # =arbitrage runs the battery-only level-field LP baseline
+        # (optimization/arbitrage_optimizer.py) with SAC's information set.
         storage0_method = os.environ.get("STORAGE0_METHOD", "learning")
-        if storage0_method not in ("learning", "optimisation"):
+        if storage0_method not in ("learning", "optimisation", "arbitrage"):
             raise ValueError(
-                f"STORAGE0_METHOD must be 'learning' or 'optimisation', got {storage0_method!r}")
+                f"STORAGE0_METHOD must be 'learning', 'optimisation' or "
+                f"'arbitrage', got {storage0_method!r}")
         self.grid.storage["id"]="None"
         for a in range (0,len(self.grid.storage)):
             method = storage0_method if a == 0 else "optimisation"
@@ -424,9 +427,10 @@ class LEM(mesa.Model):
         agent_data_list = []
 
         for agent in agents:
-            # The SAC battery decides for itself — including it here wastes a
-            # Gurobi schedule per re-plan and biases co-located HN prices.
-            if getattr(agent, "method", None) == "learning":
+            # Self-deciding batteries (SAC or the arbitrage LP) plan for
+            # themselves — including them here wastes a Gurobi schedule per
+            # re-plan and biases co-located HN prices.
+            if getattr(agent, "method", None) in ("learning", "arbitrage"):
                 continue
             if agent.flex == 0:  # Unflexible load with power profile
                 agent_data = {
@@ -507,7 +511,7 @@ class LEM(mesa.Model):
                     continue
                 max_prognosis_values = []
                 for agent in agents:
-                    if getattr(agent, "method", None) == "learning":
+                    if getattr(agent, "method", None) in ("learning", "arbitrage"):
                         continue
                     if hasattr(agent, 'max_prognosis'):
                         max_prognosis_values.append(agent.max_prognosis)
@@ -561,7 +565,7 @@ class LEM(mesa.Model):
                 # Build agent states for this bus
                 agent_states = {}
                 for agent in self.HEM_dict[bus]:
-                    if getattr(agent, "method", None) == "learning":
+                    if getattr(agent, "method", None) in ("learning", "arbitrage"):
                         continue
                     if agent.flex == 0:  # Unflexible load
                         agent_states[agent.unique_id] = {}

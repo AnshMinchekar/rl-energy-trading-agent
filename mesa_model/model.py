@@ -194,9 +194,15 @@ class LEM(mesa.Model):
         # Row 0 of the SimBench storage table IS the learning (SAC) battery at
         # its real bus; the rest run the optimisation method. No phantom
         # duplicate unit — the grid holds exactly the storage the dataset defines.
+        # STORAGE0_METHOD=optimisation routes row 0 through the same
+        # HNOptimizer/LP path as rows 1-4 (SAC-vs-optimisation benchmark).
+        storage0_method = os.environ.get("STORAGE0_METHOD", "learning")
+        if storage0_method not in ("learning", "optimisation"):
+            raise ValueError(
+                f"STORAGE0_METHOD must be 'learning' or 'optimisation', got {storage0_method!r}")
         self.grid.storage["id"]="None"
         for a in range (0,len(self.grid.storage)):
-            method = "learning" if a == 0 else "optimisation"
+            method = storage0_method if a == 0 else "optimisation"
             storage(self, self.grid.storage.loc[a]["max_e_mwh"]*1000, self.grid.storage.loc[a]["p_mw"]*-1000, self.grid.storage.loc[a]["bus"],self.grid.storage.loc[a]["efficiency_percent"], 1-self.grid.storage.loc[a]["self-discharge_percent_per_day"]/100, method)
             self.grid.storage.loc[a, "id"]=id_count
             id_count+=1

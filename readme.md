@@ -1,22 +1,24 @@
 # Storage Agent — Soft Actor-Critic (SAC)
 
-> **Branch:** `algo/soft-actor-critic`. Each `algo/*` branch implements a
-> different RL algorithm for the `storage` agent (`mesa_model/agents.py`)
-> while the rest of the Local Energy Community (LEC) simulation is
-> unchanged. This branch implements **Soft Actor-Critic** in PyTorch:
-> `mesa_model/sac.py` (algorithm), `mesa_model/storage_logic.py` (state /
-> reward / physics, shared with the fast surrogate), `mesa_model/storage_env.py`
-> (surrogate env), `train_surrogate.py` (offline trainer).
+A battery in a simulated Local Energy Community learns to trade energy for profit
+(buy cheap, sell expensive) using **Soft Actor-Critic (SAC)**, a reinforcement-learning
+method. It is compared against an optimiser (LP) that plans the same battery
+with the same information.
 
-This is a single technical reference, not a tutorial: every state feature,
-every reward term, every hyperparameter, and every script in this branch,
-each tied to the exact line(s) that implement it.
+**Result:** over 1 Jan to 30 Mar 2023, the SAC battery earned about **98% of the LP's profit**
+(€603 vs €612). The target was 75%. The charts are in `comparision_graphs/`.
+
+**Read first:** [`REPORT_How_It_Works.md`](REPORT_How_It_Works.md), the final
+report. It explains how the code works (the SAC policy, the surrogate it is trained in, and the
+arbitrage-only LP benchmark), then covers the results in detail, the project history and the
+next steps.
 
 ## Contents
 
+- [Setup (one time)](#setup-one-time)
+- [How to run, step by step](#how-to-run-step-by-step)
+- [What each Python file does](#what-each-python-file-does)
 - [System context](#system-context)
-- [Quickstart](#quickstart)
-- [File map](#file-map)
 - [Storage agent lifecycle](#storage-agent-lifecycle)
 - [Market interface: `provide_a_power` / `action_to_bid`](#market-interface-provide_a_power--action_to_bid)
 - [State vector (20-D)](#state-vector-20-d)
@@ -24,11 +26,198 @@ each tied to the exact line(s) that implement it.
 - [SAC algorithm](#sac-algorithm)
 - [Surrogate training environment](#surrogate-training-environment)
 - [Training & evaluation workflows](#training--evaluation-workflows)
-- [Analysis / benchmarking scripts](#analysis--benchmarking-scripts)
 - [Output artifacts](#output-artifacts)
-- [Current results](#current-results)
+- [Results](#results)
 - [Design history](#design-history)
 - [Known gaps](#known-gaps)
+
+---
+
+## Setup (one time)
+
+1. **Unzip the load profiles.** Extract `data/config/scenario_data/load_profile.zip` into
+   the same folder, which gives `data/config/scenario_data/load_profile.csv`. The CSV is
+   147 MB, over GitHub's 100 MB file limit, so it is stored zipped. The simulation reads
+   every `.csv` and `.parquet` in that folder at start-up and fails without this file.
+2. **Create the Python environment** (Python 3.11):
+   ```bash
+   conda env create -f environment.yml          # creates the "Diss_clean" env
+   conda activate Diss_clean
+   pip install torch --index-url https://download.pytorch.org/whl/cpu   # SAC needs PyTorch; not in environment.yml
+   ```
+3. **Gurobi licence.** The market clearing runs on Gurobi (`solver: "gurobi_direct"` in
+   `data/config/config.yaml`). A full licence is needed, such as the free academic one.
+   No licence is included in the repo. Training on the surrogate (Step 1) does **not** need
+   Gurobi. Only the full simulation (Steps 3–4) does.
+
+Run every command below from the **repository root**, because the scripts use relative paths
+such as `output/sac/...`.
+
+---
+
+## How to run, step by step
+
+**The order is: train on the surrogate first, then run the full simulation.** Training
+directly in the full simulation would take weeks, because every 15-minute step needs a Gurobi
+market solve (about 2 s). The surrogate is a fast copy of the market without the solver.
+It uses the *same* battery physics, state and reward code (`mesa_model/storage_logic.py`), so a
+policy trained there can be loaded straight into the full simulation.
+
+```
+Step 1  train_surrogate.py              trains SAC in minutes, saves a policy (.pt)
+Step 2  eval_policy_on_2023_surrogate   optional quick check of that policy (seconds, no Gurobi)
+Step 3  run_comparison_eval --mode sac  runs the frozen policy in the full simulation (~4 h)
+Step 4  run_comparison_eval --mode arbitrage, then compare_sac_vs_optimisation
+                                        optional: run the LP baseline and compare (~4 h)
+```
+
+> **A trained policy is already included** (`output/sac/surrogate_policy.pt`, the one behind
+> the final results). To reproduce the results without retraining, skip to Step 3. Step 1
+> overwrites that file unless you set `SAC_POLICY_OUT`, as shown below.
+
+The examples use bash syntax (`VAR=value command`). In **PowerShell**, set the variable first
+with `$env:VAR="value"` and then run the command. The variable stays set for the rest of that
+PowerShell session, so remove it afterwards (`Remove-Item Env:VAR`).
+
+### Step 1: Train the policy on the surrogate (about 10–15 min, no Gurobi)
+
+```bash
+SAC_POLICY_OUT=output/sac/my_policy.pt SAC_SURROGATE_STEPS=300000 python train_surrogate.py
+```
+
+- Trains on spot prices from **1 Jan 2021 to 30 Sep 2022** and checks the policy every
+  5,000 steps on **1 Oct to 31 Dec 2022** (validation). It saves the policy that scored
+  best on validation, and also saves the final one as `*_last.pt`.
+- Progress (training and validation profit) is printed to the console.
+- **The periods can be changed** with environment variables, and no code edits are needed:
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `SAC_TRAIN_START` / `SAC_TRAIN_END` | `01.01.2021 00:00` / `30.09.2022 23:45` | training window |
+  | `SAC_VAL_START` / `SAC_VAL_END` | `01.10.2022 00:00` / `31.12.2022 23:45` | validation window |
+  | `SAC_SURROGATE_STEPS` | `300000` | total training steps |
+  | `SAC_LOG_EVERY` | `5000` | steps between validation checks |
+  | `SAC_POLICY_OUT` | `output/sac/surrogate_policy.pt` | where the policy is saved |
+  | `SAC_SEED` | `42` | random seed |
+
+  Price data covers **2021–2023 only**. Keep the training and validation windows separate
+  from the test window used in Step 3 (set in `config.yaml`, default 1 Jan to 30 Mar 2023).
+  Otherwise the policy is tested on prices it has already seen.
+
+### Step 2 (optional): Quick check of the policy in the surrogate (seconds)
+
+```bash
+python analysis/eval_policy_on_2023_surrogate.py output/sac/my_policy.pt
+```
+
+Runs the policy once over Q1 2023 in the fast surrogate and prints its profit and how it used
+the battery, next to a simple-rule floor and a perfect-foresight ceiling. With the included
+policy it prints about **+€412** (floor €358, ceiling €577). This is the quickest way to see
+whether a newly trained policy is sensible before spending hours on Step 3. The Q1 2023
+window is hard-coded in this script.
+
+### Step 3: Run the trained policy in the full simulation (about 4 h, needs Gurobi)
+
+```bash
+python analysis/run_comparison_eval.py --mode sac --policy output/sac/my_policy.pt
+```
+
+- Runs the whole market (all households, farms, EVs, five batteries) over the window in
+  `data/config/config.yaml` (`simulation_start_time` / `simulation_end_time`, default
+  1 Jan to 30 Mar 2023). Battery "row 0" is driven by the frozen SAC policy, which acts
+  deterministically and doesn't learn during the run. The other four batteries use the
+  household optimiser as usual.
+- Writes `output/comparison/eval_sac.jsonl`: daily profit, energy, SOC and orders for every
+  battery, plus a summary line. Each line records the git commit, so results can be traced
+  back to the exact code version.
+- Leave `--policy` out to use the included `output/sac/surrogate_policy.pt`.
+- For a short smoke test, add `--max-steps 96` (one simulated day).
+
+Alternative: `SAC_LOAD_POLICY=output/sac/my_policy.pt SAC_EVAL=1 python main.py` does the
+same run through the original driver. It writes the per-step CSVs (`data_results_N.csv` /
+`HN_results_N.csv`) and the daily log `output/sac/episode_logs.jsonl` instead.
+
+### Step 4 (optional): Run the LP baseline and compare
+
+```bash
+python analysis/run_comparison_eval.py --mode arbitrage        # ~4 h -> output/comparison/eval_arbitrage.jsonl
+python analysis/compare_sac_vs_optimisation.py --baseline arbitrage
+```
+
+The `arbitrage` mode replaces SAC on the same battery with an LP that has exactly SAC's
+information (the current price plus the next 6 h of day-ahead prices) and SAC's objective.
+This is the fair comparison used in the final report. `compare_sac_vs_optimisation.py` prints
+the profit totals and the SAC-as-%-of-LP figure, and saves a chart to
+`output/comparison/sac_vs_arbitrage.png`. It refuses to compare runs made on different code
+versions or with uncommitted changes, so commit before running Steps 3 and 4.
+
+`--mode optimisation` is the older baseline: the battery inside the household optimiser.
+It is much slower (10–19 h) and not a like-for-like comparison. See the final report for why.
+
+---
+
+## What each Python file does
+
+**Entry points (top level)**
+- `train_surrogate.py`: trains the SAC policy on the fast surrogate (Step 1). Handles the
+  train/validation split and saves the best-on-validation checkpoint.
+- `main.py`: the original simulation driver. Runs the full market over `config.yaml`'s
+  window, and can also train SAC in the live market over several passes (`SAC_EPOCHS=N`;
+  very slow, about 5 h per pass). Writes the per-step result CSVs.
+
+**`mesa_model/`: the simulation and the SAC agent**
+- `model.py`: the simulation itself (`LEM`, a Mesa model). Loads the SimBench grid, creates
+  every agent, and runs market clearing every 15-minute step. `STORAGE0_METHOD`
+  (`learning` / `arbitrage` / `optimisation`) selects what controls battery row 0.
+- `agents.py`: all agent types (households, farms, EVs, heat pumps, generators, external
+  grid, batteries). The `storage` class holds the SAC battery's decision logic: building
+  the state, turning the action into a bid or ask, computing the reward and logging.
+- `sac.py`: the SAC algorithm (actor and twin critic networks, replay buffer, update step,
+  save/load). It contains no simulation code. `python mesa_model/sac.py` runs a self-test.
+- `storage_logic.py`: battery physics, the 20-feature state and the reward. Both the full
+  simulation and the surrogate use this file, so they behave identically.
+- `storage_env.py`: the fast surrogate market used for training. The battery trades
+  directly at spot price ± margin, with no solver.
+
+**`optimization/`: market clearing and baselines**
+- `market_optimizer.py`: clears the local market each step (Pyomo + Gurobi). Matches all
+  bids and asks under grid constraints, settles prices, and applies grid fees (batteries are
+  fee-exempt).
+- `HN_optimizer.py`: the household/node optimiser. Schedules flexible devices (EVs, heat
+  pumps and the non-SAC batteries) per grid bus with Gurobi, and runs the `optimisation`
+  baseline.
+- `arbitrage_optimizer.py`: the battery-only LP baseline used in the final comparison
+  (`--mode arbitrage`). Solved with SciPy/HiGHS, not Gurobi.
+- `postprocess_market.py`: an older standalone version of the market-results
+  post-processing. **Not used**; `market_optimizer.py` has its own copy. Kept from the
+  original codebase.
+- `__init__.py`: package marker.
+
+**`data/`: configuration and output**
+- `config/config.py`: loads `config.yaml` and every scenario file in
+  `config/scenario_data/` (prices, load and generation profiles, EV data), trimmed to the
+  simulation window. Everything else reads its settings from here.
+- `config/config.yaml`: simulation settings: grid, time window, time step, grid fees and
+  levies, solver, and agent parameters.
+- `data_handler.py`: small data classes used to pass market and bid data to the optimisers.
+- `csv_writer.py`: writes the per-step `data_results_N.csv` / `HN_results_N.csv` files from
+  `main.py`. `N` increases with each run, so earlier results are not overwritten.
+- `config/__init__.py`: package marker.
+
+**`analysis/`: evaluation**
+- `run_comparison_eval.py`: runs one full-simulation evaluation (`--mode sac`,
+  `arbitrage` or `optimisation`) and writes `output/comparison/eval_<mode>.jsonl`
+  (Steps 3–4).
+- `compare_sac_vs_optimisation.py`: compares two of those logs. It prints the totals and the
+  SAC-as-%-of-baseline figure, draws the chart, and checks that both runs used the same
+  code version.
+- `eval_policy_on_2023_surrogate.py`: quick, solver-free check of a saved policy on
+  Q1 2023 (Step 2).
+
+**`comparision_graphs/`**
+- `make_comparison_chart.py`: draws the older SAC-vs-household-optimiser chart
+  (`sac_vs_optimisation_chart.png`) from `eval_sac.jsonl` / `eval_optimisation.jsonl`.
+  Those logs are not included, so it only works after rerunning both evaluations.
 
 ---
 
@@ -39,72 +228,21 @@ Community (LEC)**: a SimBench low-voltage grid (`1-LV-rural1--2-sw`)
 populated with households, farms, industry, heat pumps, EVs, RES generators,
 and a battery `storage` agent, cleared every 15-minute step by a Pyomo/Gurobi
 LP (`optimization/market_optimizer.py`, `optimization/HN_optimizer.py`).
-This branch only changes how the `storage` agent decides what to bid; every
+The SAC work only changes how the `storage` agent decides what to bid; every
 other agent type and the clearing mechanism itself are untouched.
 
 **Objective:** the `storage` agent maximises profit through energy
 arbitrage — buy when cheap, discharge when expensive — subject to real
 round-trip efficiency losses, self-discharge, and (for every *other* market
 participant) grid fees. **Success criterion:** SAC profit should reach
->75% of the `optimisation` method's profit (a near-deterministic
-`HN_optimizer` upper bound) on the same held-out window — see
-[Known gaps](#known-gaps) for the current state of that specific
-comparison.
+>75% of an optimisation baseline's profit on the same held-out window.
+Met: SAC reaches ≈98% of the battery-only arbitrage LP — see [Results](#results).
 
 Exactly one of the SimBench grid's storage rows (row 0, at its native bus)
 runs `method="learning"` (SAC); every other storage unit in the grid runs
 `method="optimisation"` (`mesa_model/model.py:194-202`). Both methods are
 implemented in the same `storage` class (`mesa_model/agents.py:407`); this
 document only covers the `"learning"` path.
-
----
-
-## Quickstart
-
-```bash
-conda activate Diss_clean
-pip install torch --index-url https://download.pytorch.org/whl/cpu   # one-time: SAC dependency
-
-# 1. Fast path: train the policy on the no-Gurobi surrogate (~10-15 min for 300k steps)
-SAC_SURROGATE_STEPS=300000 python train_surrogate.py
-
-# 2. Honest evaluation: load the frozen policy into the real Mesa/Gurobi market
-#    over config.yaml's window (default 01.01.2023-30.03.2023, held out from training)
-SAC_LOAD_POLICY=output/sac/surrogate_policy.pt SAC_EVAL=1 python main.py
-
-# 3. Inspect the eval run
-python analysis/analyze_eval_run.py            # profit/SOC/spread breakdown + plot
-python analysis/naive_baseline_q1_2023.py       # causal-floor / perfect-foresight-ceiling reference
-
-# Alternative: train directly on the live market (slow — ~2.25 s/Gurobi-step)
-SAC_EPOCHS=1 python main.py
-```
-
-> **Dependency note:** this branch requires **PyTorch** (CPU build is
-> sufficient), which the MC/TD branches don't. `mesa_model/sac.py` sets
-> `KMP_DUPLICATE_LIB_OK=TRUE` and pins PyTorch to 1 thread so its bundled
-> OpenMP runtime coexists with Gurobi/MKL on Windows, and so the tiny
-> networks don't oversubscribe CPU against the market solve.
-
----
-
-## File map
-
-| File | Role |
-|---|---|
-| `mesa_model/sac.py` | `ReplayBuffer`, `Critic`, `GaussianActor`, `SACLearner` — the algorithm, with no simulation-specific code |
-| `mesa_model/storage_logic.py` | Single source of truth for `state_features`, `mark_to_market_reward`, `provide_power_kwh`/`soc_transition` — imported by both the live agent and the surrogate, so they see byte-identical state/reward/physics |
-| `mesa_model/storage_env.py` | `StorageArbitrageEnv` — the fast, no-Gurobi surrogate market |
-| `mesa_model/agents.py` | `storage` class (`method="learning"` path: `_setup_learning`, `provide_a_power`, `build_state`, `action_to_bid`, `compute_reward`, `step`, `update_status`, episode logging) |
-| `mesa_model/model.py` | `LEM` Mesa model: creates every agent (incl. the learning battery at `grid.storage.loc[0]`), runs the LP clearing each step, holds `sref`/`gridfee_ext`/`levies_ext`/margins used by the storage agent |
-| `optimization/market_optimizer.py` | LP clearing; zeroes the fee columns for `Agent Type == "storage"` (`§118 EnWG` exemption) and folds the external-buy fee into the welfare objective as `gridfee_levies_ext` |
-| `train_surrogate.py` | Offline SAC trainer on the surrogate: train/val split, best-on-validation checkpointing |
-| `main.py` | Live-market driver: single or multi-epoch (`SAC_EPOCHS`) pass over `config.yaml`'s window; writes `data_results_N.csv` / `HN_results_N.csv` via `data/csv_writer.py` |
-| `analysis/analyze_eval_run.py` | Isolates a frozen-policy (`SAC_EVAL=1`) run from `episode_logs.jsonl` and plots profit/SOC/spread |
-| `analysis/eval_policy_on_2023_surrogate.py` | Runs a saved policy deterministically inside the surrogate over the held-out window — isolates policy quality from live-market fill effects |
-| `analysis/naive_baseline_q1_2023.py` | Causal-threshold floor + perfect-foresight ceiling reference points, computed with the same battery physics |
-| `output/sac/episode_logs.jsonl` | Per-episode (per simulated day) JSONL log, appended by `_log_episode` |
-| `data/config/config.yaml` | `main:` block has `sref`, `timestep`, `gridfee_ext`/`levies_ext`, solver, simulation window; `storage:` block (`SOC_start`, per-bus `bus-info`, `efficiency`) is legacy and **not** what parameterises the learning battery — see [Storage agent lifecycle](#storage-agent-lifecycle) |
 
 ---
 
@@ -573,8 +711,8 @@ with one live rule mirrored exactly: a sell whose ask (`p_sell - 0.01`)
 would fall below `ASK_PRICE_FLOOR` (e.g. during negative prices) does not
 fill (`storage_env.py:147-152`). Validate any surrogate-trained policy in
 the full Mesa market before drawing conclusions from surrogate numbers
-alone — see [`eval_policy_on_2023_surrogate.py`](#analysis--benchmarking-scripts)
-for the diagnostic this enables.
+alone — `analysis/eval_policy_on_2023_surrogate.py` (Step 2 in
+[How to run](#how-to-run-step-by-step)) is the diagnostic this enables.
 
 **Episode structure:** `reset()` picks a random start index and random
 initial SOC (`soc ~ U(0.10, 0.90)`) by default, then **warms the causal
@@ -663,45 +801,14 @@ SAC_LOAD_POLICY=output/sac/surrogate_policy.pt SAC_EVAL=1 python main.py
 Runs the loaded policy deterministically over `config.yaml`'s window with
 no further learning (`eval_mode=True` skips `push`/`learn`). Episode
 records logged during this pass have `buffer_size == 0` for every
-record (since nothing is ever pushed), which is exactly the signal
-`analyze_eval_run.py` uses to isolate the eval pass from any earlier
-training-pass records that may already be in the same log file.
+record (since nothing is ever pushed), which identifies the eval pass
+when earlier training-pass records are already in the same log file.
 
----
-
-## Analysis / benchmarking scripts
-
-All three live in `analysis/` and are independent of each other.
-
-**`analyze_eval_run.py`** — reads `output/sac/episode_logs.jsonl`, finds
-the last contiguous block of `buffer_size == 0` records (the frozen-eval
-pass), and prints a warm-up (days 1–21) vs. steady-state breakdown of
-profit/day, average SOC, and captured spread (`avg_sell_price −
-avg_buy_price`), plus a 3-panel plot saved to
-`output/sac/eval_analysis.png`.
-
-**`eval_policy_on_2023_surrogate.py <policy.pt>`** — runs a saved policy
-deterministically **inside the surrogate**, using the real grid margins
-(1.0/0.3 ct/kWh) rather than the surrogate's training spread, over the
-same held-out window. Purpose: isolate policy quality from live-market
-fill effects — if this is positive/mid-SOC but the live `SAC_EVAL` run
-floor-hugs or loses money, the bug is in the market/fill path, not the
-learned policy (this is exactly how the fee-crossing bug in
-[Design history](#design-history) was diagnosed).
-
-**`naive_baseline_q1_2023.py`** — two reference points computed directly
-from `storage_logic.provide_power_kwh`/`soc_transition` (so they share
-the exact battery physics, including the corrected self-discharge), independent of the market LP or the RL agent:
-- **Causal floor**: a trailing 96-step (24 h) percentile threshold rule —
-  charge below the 33rd percentile, discharge above the 67th, no
-  foresight.
-- **Foresight ceiling**: per-calendar-day greedy threshold, searching a
-  small grid of split fractions per day for the best that-day cashflow —
-  an upper bound assuming perfect knowledge of each day's prices.
-
-Both baselines charge the same 0.2 ct/kWh round-trip spread
-`action_to_bid` crosses, so their € totals are directly comparable to the
-agents' `actual_profit_eur`.
+For the comparison runs used in the final report, prefer
+`analysis/run_comparison_eval.py --mode sac` (see
+[How to run, step by step](#how-to-run-step-by-step)): it does the same frozen
+run but writes the per-battery daily log `output/comparison/eval_sac.jsonl`
+with git provenance.
 
 ---
 
@@ -735,44 +842,40 @@ best-validation and final SAC checkpoints from `train_surrogate.py`
 (`SACLearner.state_dict()` — actor, both critics, both targets,
 `log_alpha`, step counters).
 
-**`output/sac/eval_analysis.png`** — 3-panel plot (profit/day, SOC,
-captured spread) from `analyze_eval_run.py`.
+**`output/comparison/eval_<mode>.jsonl`** — written by
+`analysis/run_comparison_eval.py`: one `meta` line (mode, window, git
+commit, battery list), one `day` line per battery per day (profit, energy
+bought/sold, orders, SOC), and one `summary` line per battery (totals,
+terminal SOC and its liquidation value). Input to
+`analysis/compare_sac_vs_optimisation.py`.
+
+**`comparision_graphs/*.png`** — the charts used in the final report.
 
 ---
 
-## Current results
+## Results
 
-Most recent frozen-policy (`SAC_EVAL=1`) evaluation in the full Mesa/Gurobi
-market, from `output/sac/episode_logs.jsonl` via `analyze_eval_run.py`
-(88 simulated days):
+Final comparison, 1 Jan – 30 Mar 2023 (89 days), storage row 0 (146.7 kWh,
+bus 12), full Mesa/Gurobi market, both runs on the same commit. Full
+analysis in [`REPORT_How_It_Works.md`](REPORT_How_It_Works.md).
 
-| Segment | Profit/day (€) | Total (€) | Avg. SOC | Avg. spread (ct) | Profitable days |
-|---|---|---|---|---|---|
-| All 88 days | +6.93 | +610.09 | 56.8% | +2.33 | 72/88 |
-| Warm-up (days 1–21) | +5.84 | +122.61 | 46.1% | +2.16 | 17/21 |
-| Steady-state (22–88) | +7.28 | +487.48 | 60.1% | +2.39 | 55/67 |
-| Last 30 days | +6.80 | +203.88 | 61.7% | +2.27 | 26/30 |
+| | SAC (frozen policy) | Arbitrage LP |
+|---|---:|---:|
+| Profit | €598.37 | €611.29 |
+| Value of charge left at the end | €4.88 | €0.91 |
+| **Adjusted profit** | **€603.25** | **€612.20** |
+| SAC as % of LP | **≈98%** (target >75%) | |
+| Profit per kWh sold | 2.23 ct | 1.76 ct |
+| Full cycles per day | 2.2 | 2.8 |
 
-Reference points on the same held-out window (Q1 2023, `python
-analysis/naive_baseline_q1_2023.py`, real 0.2 ct/kWh round-trip spread,
-95% one-way / 90% round-trip efficiency, corrected self-discharge):
+SAC moves less energy at a fatter margin; the LP cycles harder at a thinner
+one. The ≈2% gap is inside the ±1.5% cross-run noise band, and with any
+battery-wear cost (≥ ~1 ct/kWh) SAC comes out ahead.
 
-| Strategy | Profit (€) |
-|---|---|
-| Causal threshold (no foresight) | +486.50 |
-| **SAC (frozen, live market, this run)** | **+610.09** |
-| Perfect-foresight daily arbitrage (ceiling) | +735.65 |
-
-SAC currently lands between the naive causal floor and the
-perfect-foresight ceiling — a real, positive arbitrage result, not a
-degenerate one (avg. SOC mid-band at 57–62%, both buy and sell counts
-present every day). This is one snapshot, not a standing guarantee; rerun
-the eval + both analysis scripts after any change to the reward, state,
-or hyperparameters. **Not currently measured:** a same-window, same-run
-comparison against the `optimisation` (`HN_optimizer`) method's own
-storage units — the script that did this (`compare_three.py`) was removed
-during the fee-exemption rewrite and has no replacement yet (tracked in
-[Known gaps](#known-gaps)).
+Charts: `comparision_graphs/sac_vs_arbitrage only LP.png` (final),
+`comparision_graphs/profit_gap_drivers.png` (why each side leads on which
+days), `comparision_graphs/sac_vs_optimisation*.png` (the earlier,
+superseded comparison against the household optimiser).
 
 ---
 
@@ -791,8 +894,7 @@ fixing problems found in the last:
 | Price signal | lag proxies | lag proxies | causal hourly EWMA + momentum + volatility + known day-ahead prices |
 
 Within the SAC branch itself, two economics bugs (found and fixed
-2026-07-01 and 2026-07-04, full writeups in
-`analysis/codebase_review_2026-07.md`) were the difference between a
+2026-07-01 and 2026-07-04) were the difference between a
 floor-hugging money-loser and the results above:
 
 1. **Self-discharge units bug** — SimBench's
@@ -814,12 +916,6 @@ floor-hugging money-loser and the results above:
 
 ## Known gaps
 
-- **No current SAC-vs-`optimisation` head-to-head on the same run.** The
-  script that produced this comparison (`compare_three.py`) was deleted
-  during the fee-exemption rewrite; `naive_baseline_q1_2023.py`'s
-  causal/foresight bounds are a partial substitute but do not use the
-  actual `HN_optimizer` LP result. Needed to check the stated >75%
-  success criterion directly.
 - **Surrogate fill-quantity idealisation.** The surrogate assumes every
   requested volume fills; validate any surrogate-only result
   (`eval_policy_on_2023_surrogate.py`) against a live `SAC_EVAL` pass

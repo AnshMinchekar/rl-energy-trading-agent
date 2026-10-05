@@ -1,0 +1,8 @@
+type;capacity;consumption_1km;consumption_100km;Cosphi;base_price;max_lp;price_max_lp;price_min_lp;price_max_soc;price_min_soc
+BYD Seal;82.5;0.16;16;-0.98;0.25;100;1;0;0.4;0.05
+VW ID.7 Tourer Pro;77;0.17;17;-0.98;0.25;100;1;0;0.4;0.05
+BMW iX M60;115.2;0.22;22;-0.99;0.25;100;1;0;0.4;0.05
+Audi Q8 e-tron 55 quattro;106;0.23;23;-0.98;0.25;100;1;0;0.4;0.05
+Mercedes-Benz EQS 580 4M;107.8;0.23;23;-0.98;0.25;100;1;0;0.4;0.05
+Kia EV6 AWD;77.4;0.18;18;-0.98;0.25;100;1;0;0.4;0.05
+Genesis Electrified G80;87.2;0.17;17;-0.97;0.25;100;1;0;0.4;0.05

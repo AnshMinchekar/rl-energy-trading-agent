@@ -2,25 +2,32 @@
 .venv/
 .claude/
 
-# Simulation output (CSVs, episode logs are gitignored — results are local)
-output/*.csv
-output/**/*.csv
-output/episode_logs.jsonl
-
-# Ignore the contents of data/config, but not the folder itself
-data/config/*
-# Now allow the specific files
-!data/config/__init__.py
-!data/config/config.py
-
-# Ignore everything else in scenario_data
-data/scenario_data/
-docs/
-output/
-
-# Python Caches
+# Python caches
 **/__pycache__/
 *.py[cod]
-*.csv
-# Secrets
+
+# Secrets: never commit the Gurobi licence
 gurobi.lic
+
+# Simulation output is ignored by default; the handoff artefacts
+# (trained policy, eval logs, charts) are re-included below.
+*.csv
+output/*
+!output/sac/
+output/sac/*
+!output/sac/surrogate_policy.pt
+!output/sac/episode_logs.jsonl
+!output/sac/*.png
+!output/comparison/
+output/comparison/*
+!output/comparison/eval_sac.jsonl
+!output/comparison/eval_arbitrage.jsonl
+!output/comparison/eval_optimisation.jsonl
+!output/comparison/*.png
+
+# Scenario data is committed. load_profile.csv (147 MB) is over GitHub's
+# 100 MB limit, so it ships as load_profile.zip; unzip it in place.
+!data/config/scenario_data/*.csv
+data/config/scenario_data/load_profile.csv
+
+docs/
